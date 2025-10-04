@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Snap Assistant</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      background: #fdfdfd;
+      color: #333;
+    }
+    h2 { margin-bottom: 10px; }
+    .section {
+      margin-bottom: 20px;
+    }
+    .box {
+      white-space: pre-wrap;
+      border: 1px solid #ddd;
+      padding: 15px;
+      background: #fafafa;
+      border-radius: 6px;
+      line-height: 1.6;
+    }
+    #ocr span.word {
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 3px;
+    }
+    #ocr span.word:hover {
+      background: #e0f0ff;
+    }
+    /* Style cho định dạng bản dịch */
+    #translation strong {
+      color: #005a9e;
+    }
+    #translation code {
+      background: #eee;
+      padding: 2px 4px;
+      border-radius: 3px;
+      font-family: monospace;
+    }
+    #translation ul {
+      margin: 5px 0 10px 20px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="section">
+    <div id="ocr" class="box">⏳ Chưa có kết quả OCR...</div>
+  </div>
+
+  <div class="section">
+    <div id="translation" class="box">⏳ Chưa có bản dịch...</div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron');
+
+    // Bọc từng từ OCR để click phát âm
+    function wrapWords(text) {
+      return text
+        .split(/(\s+)/)
+        .map(token => {
+          if (/^[A-Za-z]+$/.test(token)) {
+            return `<span class="word">${token}</span>`;
+          }
+          return token;
+        })
+        .join('');
+    }
+
+    // Hàm định dạng văn bản dịch (Markdown đơn giản)
+    function formatText(text) {
+      let html = text
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')   // **bold**
+        .replace(/`(.*?)`/g, '<code>$1</code>')             // `code`
+        .replace(/^\* (.*)$/gm, '<li>$1</li>');             // * bullet
+      html = html.replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>');
+      return html;
+    }
+
+    // Nhận kết quả từ main process
+    ipcRenderer.on('screenshot-result', (event, result) => {
+      const ocrText = result.ocr || "";
+      const translation = result.translation || "";
+
+      document.getElementById('ocr').innerHTML = wrapWords(ocrText);
+      document.getElementById('translation').innerHTML = formatText(translation);
+    });
+
+    // Click vào từ OCR để phát âm
+    document.addEventListener('click', (e) => {
+      if (e.target.classList.contains('word')) {
+        const word = e.target.innerText;
+        if (/^[A-Za-z]+$/.test(word)) {
+          const utter = new SpeechSynthesisUtterance(word);
+          utter.lang = 'en-US';
+          window.speechSynthesis.speak(utter);
+        }
+      }
+    });
+  </script>
+</body>
+</html>

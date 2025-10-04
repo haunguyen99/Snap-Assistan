@@ -1,0 +1,67 @@
+{
+  "name": "snap-assistant",
+  "productName": "Snap Assistant",
+  "version": "1.0.0",
+  "description": "Screenshot → OCR (Tesseract) → Translate (Gemini) với overlay chọn vùng.",
+  "main": "main.js",
+  "author": "Your Name",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "pack": "electron-builder --dir",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win nsis",
+    "build:mac": "electron-builder --mac dmg",
+    "build:linux": "electron-builder --linux AppImage"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0",
+    "node-fetch": "^3.3.2",
+    "tesseract.js": "^5.1.0"
+  },
+  "devDependencies": {
+    "electron": "^32.1.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.yourcompany.snapassistant",
+    "productName": "Snap Assistant",
+    "asar": true,
+    "asarUnpack": [
+      "**/tessdata/**"
+    ],
+    "files": [
+      "**/*",
+      "!**/*.map",
+      "!**/.git/**",
+      "!**/node_modules/.cache/**"
+    ],
+    "directories": {
+      "buildResources": "build"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "mac": {
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Utility",
+      "icon": "build"
+    },
+    "extraMetadata": {
+      "name": "Snap Assistant"
+    }
+  }
+}

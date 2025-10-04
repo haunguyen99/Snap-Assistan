@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Snap Assistant</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      background: #fdfdfd;
+    }
+    h2 {
+      margin-bottom: 10px;
+    }
+    input {
+      padding: 6px;
+      margin: 5px 0;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    button {
+      padding: 6px 12px;
+      margin-left: 5px;
+      background: #0078d7;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #005a9e;
+    }
+    hr {
+      margin: 20px 0;
+    }
+    .section {
+      margin-bottom: 20px;
+    }
+    label {
+      font-weight: bold;
+      display: block;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="section">
+    <label for="apiKeyInput">Nhập Gemini API Key:</label>
+    <input type="text" id="apiKeyInput" style="width:70%">
+    <button id="saveKeyBtn">Lưu Key</button>
+  </div>
+
+  <hr>
+
+  <div class="section">
+    <label for="hotkeyInput">Phím tắt (ví dụ: <code>CommandOrControl+Shift+S</code>):</label>
+    <input type="text" id="hotkeyInput" style="width:70%">
+    <button id="saveHotkeyBtn">Lưu Hotkey</button>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
