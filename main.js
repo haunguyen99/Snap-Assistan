@@ -1,4 +1,4 @@
-// main.js — Snap Assistant with local HTTP tessdata server + single-file capture + detailed logging
+// main.js — Snap Assistant with: local HTTP tessdata server + single-file capture + autostart + detailed logging
 const {
   app, BrowserWindow, ipcMain, desktopCapturer, screen,
   globalShortcut, Tray, Menu
@@ -29,6 +29,7 @@ let tray;
 let tessdataDir = '';     // thư mục chứa *.traineddata thực tế
 let tessServer = null;    // http.Server
 let tessBaseURL = '';     // ví dụ: http://127.0.0.1:54321/
+let initialShowWindows = true; // ẩn khi khởi động cùng hệ thống nếu mở với --hidden
 
 // ========================= Logger =========================
 let logStream = null;
@@ -257,10 +258,68 @@ async function writeAtomicBase64(target, base64) {
   }
 }
 
+// ========================= Auto-Launch at Login (Win/macOS/Linux) =========================
+const isWin = process.platform === 'win32';
+const isMac = process.platform === 'darwin';
+const isLinux = process.platform === 'linux';
+
+function linuxAutostartDesktopPath() {
+  const dir = path.join(os.homedir(), '.config', 'autostart');
+  return path.join(dir, 'snap-assistant.desktop');
+}
+function getAutoLaunchStatus() {
+  if (isWin || isMac) {
+    const s = app.getLoginItemSettings ? app.getLoginItemSettings() : { openAtLogin: false };
+    return { enabled: !!s.openAtLogin };
+  }
+  // Linux: check .desktop exists
+  return { enabled: exists(linuxAutostartDesktopPath()) };
+}
+async function setAutoLaunch(enable, openHidden) {
+  try {
+    if (isWin || isMac) {
+      const args = [];
+      if (openHidden && isWin) args.push('--hidden');
+      app.setLoginItemSettings({
+        openAtLogin: !!enable,
+        openAsHidden: isMac ? !!openHidden : undefined,
+        path: process.execPath,
+        args
+      });
+      return true;
+    } else {
+      // Linux: tạo/xoá ~/.config/autostart/snap-assistant.desktop
+      const desktopDir = path.dirname(linuxAutostartDesktopPath());
+      await fsp.mkdir(desktopDir, { recursive: true }).catch(() => {});
+      const execCmd = `"${process.execPath}"${openHidden ? ' --hidden' : ''}`;
+      const content =
+`[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Snap Assistant
+Comment=Start Snap Assistant on login
+Exec=${execCmd}
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+Terminal=false
+`;
+      if (enable) {
+        await fsp.writeFile(linuxAutostartDesktopPath(), content, 'utf8');
+      } else {
+        if (exists(linuxAutostartDesktopPath())) await fsp.unlink(linuxAutostartDesktopPath()).catch(() => {});
+      }
+      return true;
+    }
+  } catch (e) {
+    log.error('setAutoLaunch failed', { message: e?.message });
+    return false;
+  }
+}
+
 // ========================= Windows =========================
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 500, height: 400, show: true, title: '⚙️ Snap Assistant - Settings',
+    width: 530, height: 261, show: initialShowWindows, title: 'Snap Assistant - Settings', autoHideMenuBar: true,  
     webPreferences: { preload: path.join(__dirname, 'renderer.js'), nodeIntegration: true, contextIsolation: false }
   });
   mainWindow.loadFile('index.html');
@@ -269,7 +328,7 @@ function createMainWindow() {
 }
 function createResultWindow() {
   resultWindow = new BrowserWindow({
-    width: 700, height: 450, show: false, title: '📑 Kết quả OCR + Dịch',
+    width: 700, height: 450, show: false, title: 'Snap Assistant', autoHideMenuBar: true,  
     webPreferences: { nodeIntegration: true, contextIsolation: false }
   });
   resultWindow.loadFile('result.html');
@@ -293,6 +352,18 @@ function registerHotkey(accelerator) {
 app.whenReady().then(async () => {
   const logPath = ensureLogStream();
 
+  // Ẩn cửa sổ nếu app được mở khi đăng nhập hoặc chạy với --hidden
+  let wasOpenedAtLogin = false;
+  try {
+    if (isWin || isMac) {
+      const s = app.getLoginItemSettings?.() || {};
+      wasOpenedAtLogin = !!s.wasOpenedAtLogin || !!s.openAtLogin;
+    }
+  } catch {}
+  const startHidden = wasOpenedAtLogin || process.argv.includes('--hidden');
+  initialShowWindows = !startHidden;
+  log.step('Startup visibility', { wasOpenedAtLogin, argvHidden: process.argv.includes('--hidden'), startHidden });
+
   // 1) Chọn thư mục tessdata an toàn (không app.asar) + copy nếu cần
   tessdataDir = await resolveSafeTessdataPath();
 
@@ -308,6 +379,10 @@ app.whenReady().then(async () => {
     mode: singleCapture ? 'single' : 'unique-per-run',
     singlePath: singleCapture ? fixedCapturePath() : null
   });
+
+  // Log trạng thái autostart hiện tại
+  const auto = getAutoLaunchStatus();
+  log.step('Autostart status', auto);
 
   log.step('App ready', {
     platform: process.platform,
@@ -364,7 +439,7 @@ app.on('will-quit', () => {
   log.step('App will-quit: unregistered all hotkeys');
 });
 
-// ========================= API Key / Hotkey / Capture-mode IPC =========================
+// ========================= API Key / Hotkey / Capture-mode / Autostart IPC =========================
 ipcMain.handle('save-api-key', (_e, key) => {
   const trimmed = String(key || '').trim();
   if (trimmed) { store.set('geminiApiKey', trimmed); log.step('API key saved'); return true; }
@@ -381,12 +456,23 @@ ipcMain.handle('save-hotkey', (_e, hotkey) => {
 });
 ipcMain.handle('get-hotkey', () => store.get('hotkey') || 'CommandOrControl+Shift+S');
 
-// Bật/tắt chế độ lưu 1 file duy nhất
+// Single-file capture toggle
 ipcMain.handle('get-single-capture', () => !!store.get('singleCapture', true));
 ipcMain.handle('set-single-capture', (_e, on) => {
   store.set('singleCapture', !!on);
   log.step('Single capture toggled', { enabled: !!on, path: fixedCapturePath() });
   return !!on;
+});
+
+// Autostart toggles
+ipcMain.handle('get-auto-launch', () => {
+  const s = getAutoLaunchStatus();
+  return { enabled: !!s.enabled };
+});
+ipcMain.handle('set-auto-launch', async (_e, { enable, openHidden = true } = {}) => {
+  const ok = await setAutoLaunch(!!enable, !!openHidden);
+  log.step('Autostart updated', { enable: !!enable, openHidden: !!openHidden, ok });
+  return ok;
 });
 
 // ========================= Fallback dịch =========================
@@ -604,9 +690,17 @@ ipcMain.handle('region-selected', async (_event, dataUrl) => {
   } finally {
     // Dọn file tạm: chỉ xoá nếu KHÔNG ở chế độ single-file
     const singleCapture = store.get('singleCapture', true);
-    if (!singleCapture && tmpPath) {
-      fsp.unlink(tmpPath).then(() => log.info('Temp image deleted', { tmpPath }))
-        .catch((e) => log.warn('Temp image delete failed', { tmpPath, message: e?.message }));
+    if (!singleCapture) {
+      try {
+        // tmpPath có thể trùng fixedCapturePath() → chỉ xoá khi unique
+        const isUnique = !singleCapture && tmpPath && !tmpPath.endsWith('-capture.png');
+        if (isUnique) {
+          await fsp.unlink(tmpPath);
+          log.info('Temp image deleted', { tmpPath });
+        }
+      } catch (e) {
+        log.warn('Temp image delete failed', { tmpPath, message: e?.message });
+      }
     }
     log.perf('Region pipeline total', { ms: Date.now() - pipelineStart });
   }
