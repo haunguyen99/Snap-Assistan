@@ -4,6 +4,8 @@ const { ipcRenderer } = require('electron');
 const $ = (id) => document.getElementById(id);
 const apiKeyInput = $('apiKeyInput');
 const hotkeyInput = $('hotkeyInput');
+// 🔥 Khai báo input mới
+const chatHotkeyInput = $('chatHotkeyInput'); 
 const autoLaunchToggle = $('autoLaunchToggle');
 const autoLaunchHiddenToggle = $('autoLaunchHiddenToggle');
 const singleCaptureToggle = $('singleCaptureToggle');
@@ -23,6 +25,8 @@ async function loadInitial() {
   try {
     apiKeyInput.value = (await ipcRenderer.invoke('get-api-key')) || '';
     hotkeyInput.value = (await ipcRenderer.invoke('get-hotkey')) || 'CommandOrControl+Shift+S';
+    // 🔥 Tải giá trị phím tắt Chat
+    chatHotkeyInput.value = (await ipcRenderer.invoke('get-chat-hotkey')) || 'CommandOrControl+Shift+C';
 
     const auto = await ipcRenderer.invoke('get-auto-launch');
     autoLaunchToggle.checked = !!(auto && auto.enabled);
@@ -30,19 +34,25 @@ async function loadInitial() {
 
     singleCaptureToggle.checked = !!(await ipcRenderer.invoke('get-single-capture'));
   } catch (e) {
-    console.error(e);
-    setStatus('Không tải được cấu hình', false, 2500);
+    console.error('Lỗi tải cài đặt ban đầu:', e);
+    setStatus('Lỗi tải cài đặt', false, 3000);
   }
 }
 
-async function applyAll() {
+async function handleApply() {
+  setStatus('Đang áp dụng...');
   try {
     // 1) API Key
     await ipcRenderer.invoke('save-api-key', apiKeyInput.value.trim());
 
-    // 2) Hotkey
+    // 2) Hotkey Chụp
     const okHotkey = await ipcRenderer.invoke('save-hotkey', hotkeyInput.value.trim());
-    if (!okHotkey) return setStatus('Không đăng ký được phím tắt', false, 3000);
+    if (!okHotkey) return setStatus('Không đăng ký được phím tắt Chụp', false, 3000);
+    
+    // 🔥 Lưu Hotkey Chat
+    const okChatHotkey = await ipcRenderer.invoke('save-chat-hotkey', chatHotkeyInput.value.trim());
+    if (!okChatHotkey) return setStatus('Không đăng ký được phím tắt Chat', false, 3000);
+
 
     // 3) Autostart
     const enable = !!autoLaunchToggle.checked;
@@ -65,14 +75,16 @@ function setDefaultsOnlyInUI() {
   // Chỉ đặt lại form; nhấn "Áp dụng" mới ghi xuống main
   apiKeyInput.value = '';
   hotkeyInput.value = 'CommandOrControl+Shift+S';
+  // 🔥 Đặt lại mặc định phím tắt Chat
+  chatHotkeyInput.value = 'CommandOrControl+Shift+C'; 
   autoLaunchToggle.checked = false;
   autoLaunchHiddenToggle.checked = true;
-  singleCaptureToggle.checked = true;
-  setStatus('Đã đưa về mặc định (chưa lưu)', true, 2000);
+  singleCaptureToggle.checked = false;
+  setStatus('Đã đặt lại mặc định trên form', true, 1600);
 }
 
-btnApply.addEventListener('click', applyAll);
+btnApply.addEventListener('click', handleApply);
 btnDefault.addEventListener('click', setDefaultsOnlyInUI);
-btnClose.addEventListener('click', () => window.close());
+btnClose.addEventListener('click', () => ipcRenderer.send('close-main'));
 
-document.addEventListener('DOMContentLoaded', loadInitial);
+loadInitial();
