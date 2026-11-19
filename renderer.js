@@ -3,9 +3,8 @@ const { ipcRenderer } = require('electron');
 
 const $ = (id) => document.getElementById(id);
 const apiKeyInput = $('apiKeyInput');
-const hotkeyInput = $('hotkeyInput');
-// 🔥 Khai báo input mới
-const chatHotkeyInput = $('chatHotkeyInput'); 
+const HOTKEY_IDS = ['capture', 'ocr', 'chat'];
+let hotkeyDefaults = {};
 const autoLaunchToggle = $('autoLaunchToggle');
 const autoLaunchHiddenToggle = $('autoLaunchHiddenToggle');
 const singleCaptureToggle = $('singleCaptureToggle');
@@ -24,9 +23,7 @@ function setStatus(msg, ok = true, ttl = 1600) {
 async function loadInitial() {
   try {
     apiKeyInput.value = (await ipcRenderer.invoke('get-api-key')) || '';
-    hotkeyInput.value = (await ipcRenderer.invoke('get-hotkey')) || 'CommandOrControl+Shift+S';
-    // 🔥 Tải giá trị phím tắt Chat
-    chatHotkeyInput.value = (await ipcRenderer.invoke('get-chat-hotkey')) || 'CommandOrControl+Shift+C';
+    await loadHotkeys();
 
     const auto = await ipcRenderer.invoke('get-auto-launch');
     autoLaunchToggle.checked = !!(auto && auto.enabled);
@@ -45,14 +42,12 @@ async function handleApply() {
     // 1) API Key
     await ipcRenderer.invoke('save-api-key', apiKeyInput.value.trim());
 
-    // 2) Hotkey Chụp
-    const okHotkey = await ipcRenderer.invoke('save-hotkey', hotkeyInput.value.trim());
-    if (!okHotkey) return setStatus('Không đăng ký được phím tắt Chụp', false, 3000);
-    
-    // 🔥 Lưu Hotkey Chat
-    const okChatHotkey = await ipcRenderer.invoke('save-chat-hotkey', chatHotkeyInput.value.trim());
-    if (!okChatHotkey) return setStatus('Không đăng ký được phím tắt Chat', false, 3000);
-
+    // 2) Phím tắt cho 3 tính năng
+    const map = {};
+    HOTKEY_IDS.forEach((id) => { map[id] = getHotkeyValue(id); });
+    const hk = await ipcRenderer.invoke('save-hotkeys', map);
+    await loadHotkeys();
+    if (!hk || !hk.ok) return setStatus(hk?.error || 'Không lưu được phím tắt', false, 5000);
 
     // 3) Autostart
     const enable = !!autoLaunchToggle.checked;
@@ -74,14 +69,120 @@ async function handleApply() {
 function setDefaultsOnlyInUI() {
   // Chỉ đặt lại form; nhấn "Áp dụng" mới ghi xuống main
   apiKeyInput.value = '';
-  hotkeyInput.value = 'CommandOrControl+Shift+S';
-  // 🔥 Đặt lại mặc định phím tắt Chat
-  chatHotkeyInput.value = 'CommandOrControl+Shift+C'; 
+  HOTKEY_IDS.forEach((id) => setHotkeyValue(id, hotkeyDefaults[id] || ''));
   autoLaunchToggle.checked = false;
   autoLaunchHiddenToggle.checked = true;
   singleCaptureToggle.checked = false;
   setStatus('Đã đặt lại mặc định trên form', true, 1600);
 }
+
+// ---------------------------------------------------------------- hotkey recorder
+// Values are Electron accelerators ("CommandOrControl+Shift+S"); the field shows "Ctrl + Shift + S".
+const CODE_MAP = {
+  Space: 'Space', Tab: 'Tab', Enter: 'Enter', Insert: 'Insert', Delete: 'Delete', Home: 'Home', End: 'End',
+  PageUp: 'PageUp', PageDown: 'PageDown', PrintScreen: 'PrintScreen',
+  ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+  Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backslash: '\\',Semicolon: ';',
+  Quote: "'", Comma: ',', Period: '.', Slash: '/', Backquote: '`',
+  NumpadAdd: 'numadd', NumpadSubtract: 'numsub', NumpadMultiply: 'nummult', NumpadDivide: 'numdiv', NumpadDecimal: 'numdec'
+};
+
+function keyFromCode(code) {
+  let m;
+  if ((m = /^Key([A-Z])$/.exec(code))) return m[1];
+  if ((m = /^Digit(\d)$/.exec(code))) return m[1];
+  if ((m = /^Numpad(\d)$/.exec(code))) return `num${m[1]}`;
+  if (/^F([1-9]|1\d|2[0-4])$/.test(code)) return code;
+  return CODE_MAP[code] || null;
+}
+
+function prettyAccel(accel) {
+  if (!accel) return 'Không dùng';
+  return accel.split('+').map((p) => ({ CommandOrControl: 'Ctrl', Control: 'Ctrl', Super: 'Win', Meta: 'Win' }[p] || p)).join(' + ');
+}
+
+function setHotkeyValue(id, accel) {
+  const el = $(`hk-${id}`);
+  el.dataset.accel = accel || '';
+  el.value = prettyAccel(accel);
+  el.classList.toggle('empty', !accel);
+}
+function getHotkeyValue(id) { return $(`hk-${id}`).dataset.accel || ''; }
+
+async function loadHotkeys() {
+  const all = await ipcRenderer.invoke('get-hotkeys');
+  HOTKEY_IDS.forEach((id) => {
+    const h = all[id] || {};
+    hotkeyDefaults[id] = h.def || '';
+    setHotkeyValue(id, h.accel || '');
+    const dot = $(`dot-${id}`);
+    dot.className = 'dot' + (h.accel ? (h.active ? ' on' : ' off') : '');
+    dot.title = !h.accel ? 'Không dùng' : h.active ? 'Đang hoạt động' : 'Không đăng ký được (phím có thể đã bị app khác dùng)';
+  });
+}
+
+document.querySelectorAll('input.hotkey').forEach((el) => {
+  const id = el.dataset.id;
+  let before = '';
+
+  const finish = (accel) => {
+    setHotkeyValue(id, accel);
+    el.blur();
+  };
+
+  el.addEventListener('focus', () => {
+    before = getHotkeyValue(id);
+    el.classList.add('recording');
+    el.classList.remove('empty');
+    el.value = 'Nhấn tổ hợp phím...';
+    ipcRenderer.send('hotkeys-suspend');
+  });
+  el.addEventListener('blur', () => {
+    el.classList.remove('recording');
+    if (el.value === 'Nhấn tổ hợp phím...' || el.classList.contains('partial')) setHotkeyValue(id, before);
+    el.classList.remove('partial');
+    ipcRenderer.send('hotkeys-resume');
+  });
+
+  const handle = (e) => {
+    e.preventDefault();
+    const mods = [];
+    if (e.ctrlKey) mods.push('CommandOrControl');
+    if (e.altKey) mods.push('Alt');
+    if (e.shiftKey) mods.push('Shift');
+    if (e.metaKey) mods.push('Super');
+
+    if (!mods.length && e.code === 'Escape') return finish(before);
+    if (!mods.length && (e.code === 'Backspace' || e.code === 'Delete')) return finish('');
+
+    const key = keyFromCode(e.code);
+    if (!key) { // only modifiers so far: show them while the user holds them
+      el.value = mods.length ? prettyAccel(mods.join('+')) + ' + ...' : 'Nhấn tổ hợp phím...';
+      el.classList.toggle('partial', mods.length > 0);
+      return;
+    }
+    const standalone = /^F\d+$/.test(key) || key === 'PrintScreen';
+    if (!mods.length && !standalone) {
+      setStatus('Cần kèm Ctrl / Alt / Shift / Win (trừ F1–F24, PrintScreen)', false, 2500);
+      return;
+    }
+    const accel = [...mods, key].join('+');
+    const clash = HOTKEY_IDS.find((other) => other !== id && getHotkeyValue(other) === accel);
+    if (clash) {
+      setStatus(`Trùng phím với "${$(`hk-${clash}`).closest('.hk-row').previousElementSibling.textContent}"`, false, 2500);
+      return;
+    }
+    el.classList.remove('partial');
+    finish(accel);
+  };
+  el.addEventListener('keydown', handle);
+  // Windows only sends keyup for PrintScreen
+  el.addEventListener('keyup', (e) => { if (e.code === 'PrintScreen') handle(e); });
+});
+
+document.querySelectorAll('[data-reset]').forEach((btn) => {
+  btn.addEventListener('click', () => setHotkeyValue(btn.dataset.reset, hotkeyDefaults[btn.dataset.reset] || ''));
+});
 
 btnApply.addEventListener('click', handleApply);
 btnDefault.addEventListener('click', setDefaultsOnlyInUI);

@@ -42,7 +42,11 @@ window.addEventListener('DOMContentLoaded', () => {
   window.focus();
 });
 
-ipcRenderer.on('set-image', (_e, dataUrl) => {
+// 'capture' = full Lightshot-style editor; 'ocr' = OCR & translate as soon as a region is picked
+let overlayMode = 'capture';
+
+ipcRenderer.on('set-image', (_e, dataUrl, mode) => {
+  overlayMode = mode === 'ocr' ? 'ocr' : 'capture';
   img.onload = () => { resizeCanvas(); };
   img.src = dataUrl;
 });
@@ -179,7 +183,7 @@ function updateChrome() {
   label.style.left = `${above ? x : x + 4}px`;
   label.style.top = `${above ? y - lh - 4 : y + 4}px`;
 
-  const showTools = mode !== 'selecting';
+  const showTools = mode !== 'selecting' && overlayMode !== 'ocr';
   tv.style.display = th.style.display = showTools ? 'flex' : 'none';
   if (!showTools) return;
 
@@ -270,6 +274,12 @@ function onMove(e) {
 
 function onUp() {
   if (mode === 'selecting' && sel && (sel.w < MIN_SEL || sel.h < MIN_SEL)) sel = null;
+  if (mode === 'selecting' && sel && overlayMode === 'ocr') {
+    mode = 'idle';
+    render();
+    doAction('ocr');
+    return;
+  }
   if (mode === 'drawing' && current) {
     if (isMeaningful(current)) shapes.push(current);
     current = null;

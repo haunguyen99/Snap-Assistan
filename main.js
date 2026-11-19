@@ -129,53 +129,88 @@ ipcMain.handle('chat-ask', async (_event, message) => {
 
 
 
-ipcMain.handle('get-hotkey', () => store.get('hotkey') || 'CommandOrControl+Shift+S');
-ipcMain.handle('save-hotkey', (_e, hotkey) => {
-  const h = String(hotkey || '').trim();
-  if (!h) return false;
-  store.set('hotkey', h);
-  globalShortcut.unregisterAll();
-  globalShortcut.register(h, () => openOverlay().catch(console.error));
-  return true;
-});
-
 ipcMain.handle('get-single-capture', () => !!store.get('singleCapture', true));
 ipcMain.handle('set-single-capture', (_e, on) => { store.set('singleCapture', !!on); return !!on; });
 
-// 🔥 HANDLER MỚI CHO PHÍM TẮT CHAT
-ipcMain.handle('get-chat-hotkey', () => store.get('chatHotkey', 'CommandOrControl+Shift+C'));
-ipcMain.handle('save-chat-hotkey', (_e, hotkey) => {
-  const oldHotkey = store.get('chatHotkey');
-  const newHotkey = String(hotkey || '').trim();
+// =============== Global hotkeys (3 main features) ===============
+// An empty accelerator means the feature has no hotkey.
+const HOTKEYS = {
+  capture: { storeKey: 'captureHotkey', def: 'CommandOrControl+Shift+X', label: 'Chụp màn hình', run: () => openOverlay('capture') },
+  ocr:     { storeKey: 'hotkey',        def: 'CommandOrControl+Shift+S', label: 'OCR & Dịch',     run: () => openOverlay('ocr') },
+  chat:    { storeKey: 'chatHotkey',    def: 'CommandOrControl+Shift+C', label: 'Chat AI',        run: () => { if (!chatWindow) createChatWindow(); openOrFocus(chatWindow); } }
+};
+const activeHotkeys = {}; // id -> accelerator currently registered
 
-  // Bỏ đăng ký phím tắt cũ
-  if (oldHotkey) globalShortcut.unregister(oldHotkey);
+function getHotkey(id) { return String(store.get(HOTKEYS[id].storeKey, HOTKEYS[id].def) ?? ''); }
 
-  if (!newHotkey) {
-    store.delete('chatHotkey');
-    return true;
-  }
-
-  // Đăng ký phím tắt mới
-  const registered = globalShortcut.register(newHotkey, () => {
-    if (!chatWindow) createChatWindow();
-    openOrFocus(chatWindow);
-  });
-  
-  if (registered) {
-    store.set('chatHotkey', newHotkey);
-    log(`Phím tắt Chat mới đã đăng ký: ${newHotkey}`);
-    return true;
-  } else {
-    log(`❌ Lỗi đăng ký phím tắt Chat: ${newHotkey}`);
-    // Đăng ký lại phím tắt cũ nếu có lỗi
-    if (oldHotkey) globalShortcut.register(oldHotkey, () => {
-        if (!chatWindow) createChatWindow();
-        openOrFocus(chatWindow);
-    });
+function registerHotkey(id, accel) {
+  if (!accel) return true;
+  try {
+    const ok = globalShortcut.register(accel, () => Promise.resolve(HOTKEYS[id].run()).catch(console.error));
+    if (ok) activeHotkeys[id] = accel;
+    return ok;
+  } catch (e) {
+    log(`Phím tắt không hợp lệ (${id}): ${accel}`, e.message);
     return false;
   }
+}
+
+function unregisterHotkeys() {
+  for (const accel of Object.values(activeHotkeys)) globalShortcut.unregister(accel);
+  for (const id of Object.keys(activeHotkeys)) delete activeHotkeys[id];
+}
+
+// Registers the saved hotkeys; returns { id: true|false } (false = taken by another app or invalid).
+function registerAllHotkeys() {
+  unregisterHotkeys();
+  const result = {};
+  for (const id of Object.keys(HOTKEYS)) {
+    const accel = getHotkey(id);
+    result[id] = registerHotkey(id, accel);
+    if (accel) log(`Phím tắt ${HOTKEYS[id].label}: ${accel} ${result[id] ? '✓' : '✗ (đã bị chiếm hoặc không hợp lệ)'}`);
+  }
+  return result;
+}
+
+ipcMain.handle('get-hotkeys', () => {
+  const out = {};
+  for (const id of Object.keys(HOTKEYS)) {
+    out[id] = { accel: getHotkey(id), def: HOTKEYS[id].def, label: HOTKEYS[id].label, active: activeHotkeys[id] === getHotkey(id) && !!activeHotkeys[id] };
+  }
+  return out;
 });
+
+ipcMain.handle('save-hotkeys', (_e, map = {}) => {
+  const next = {};
+  for (const id of Object.keys(HOTKEYS)) next[id] = String(map[id] ?? getHotkey(id)).trim();
+
+  const seen = {};
+  for (const [id, accel] of Object.entries(next)) {
+    if (!accel) continue;
+    if (seen[accel]) return { ok: false, error: `${HOTKEYS[id].label} trùng phím với ${HOTKEYS[seen[accel]].label}` };
+    seen[accel] = id;
+  }
+
+  const previous = {};
+  for (const id of Object.keys(HOTKEYS)) previous[id] = getHotkey(id);
+  for (const [id, accel] of Object.entries(next)) store.set(HOTKEYS[id].storeKey, accel);
+  const result = registerAllHotkeys();
+
+  const failed = Object.keys(result).filter(id => !result[id]);
+  if (failed.length) {
+    // Keep working hotkeys; restore the old value for the ones that failed.
+    for (const id of failed) store.set(HOTKEYS[id].storeKey, previous[id]);
+    registerAllHotkeys();
+    return { ok: false, failed, error: `Không đăng ký được: ${failed.map(id => `${HOTKEYS[id].label} (${next[id]})`).join(', ')} — phím có thể đã bị app khác dùng` };
+  }
+  return { ok: true };
+});
+
+// While the settings window records a new combo, stop global hotkeys from firing.
+ipcMain.on('hotkeys-suspend', () => unregisterHotkeys());
+ipcMain.on('hotkeys-resume', () => registerAllHotkeys());
+
+ipcMain.on('close-main', () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); });
 
 log('✅ IPC handlers registered');
 
@@ -187,7 +222,7 @@ function openOrFocus(win) { if (win && !win.isDestroyed()) { win.show(); win.foc
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 600, height: 300, show: true,
+    width: 600, height: 380, show: true,
     title: 'Snap Assistant - Settings', autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'renderer.js'), nodeIntegration: true, contextIsolation: false }
   });
@@ -216,7 +251,7 @@ function createResultWindow() {
 }
 
 // =============== Overlay & OCR ===============
-async function openOverlay() {
+async function openOverlay(mode = 'capture') {
   if (overlayWindow && !overlayWindow.isDestroyed()) { overlayWindow.focus(); return; }
   const display = screen.getPrimaryDisplay();
   // Capture at physical resolution so HiDPI screens stay sharp.
@@ -235,7 +270,7 @@ async function openOverlay() {
   overlayWindow.on('closed', () => overlayWindow = null);
   overlayWindow.loadFile('overlay.html');
   overlayWindow.webContents.once('did-finish-load', () => {
-    overlayWindow.webContents.send('set-image', image);
+    overlayWindow.webContents.send('set-image', image, mode);
     overlayWindow.show();
     overlayWindow.focus();
   });
@@ -356,26 +391,15 @@ app.whenReady().then(() => {
   tray = new Tray(path.join(__dirname, 'icon.png'));
   tray.setToolTip('Snap Assistant');
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Chụp màn hình', click: () => openOverlay() },
+    { label: 'Chụp màn hình', click: () => openOverlay('capture') },
+    { label: 'OCR & Dịch', click: () => openOverlay('ocr') },
     { label: 'Chat với AI', click: () => { if (!chatWindow) createChatWindow(); openOrFocus(chatWindow); } },
     { label: 'Mở Settings', click: () => openOrFocus(mainWindow) },
     { type: 'separator' },
     { label: 'Thoát', click: () => { app.isQuiting = true; app.quit(); } }
   ]));
 
-  const hotkey = store.get('hotkey') || 'CommandOrControl+Shift+S';
-  globalShortcut.register(hotkey, () => openOverlay().catch(console.error));
-
-  // 🔥 Đăng ký phím tắt Chat (sử dụng giá trị đã lưu)
-  const chatHotkey = store.get('chatHotkey', 'CommandOrControl+Shift+C'); // Lấy từ store
-  globalShortcut.register(chatHotkey, () => {
-    if (!chatWindow) createChatWindow();
-    openOrFocus(chatWindow);
-  });
-  
-  if (globalShortcut.isRegistered(chatHotkey)) {
-    log(`Phím tắt Chat đã đăng ký: ${chatHotkey}`);
-  }
+  registerAllHotkeys();
 
   log('App ready');
 });

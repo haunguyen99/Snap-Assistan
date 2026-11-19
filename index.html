@@ -39,6 +39,15 @@
     .ok { color:#0a7e0a; }
     .err { color:#b60000; }
     .hint { font-size: 12px; color:#666; }
+    .section-title { font-size: 13px; font-weight: 600; margin-top: 6px; }
+    .section-title .hint { font-weight: 400; font-size: 11px; }
+    input.hotkey { cursor: pointer; font-weight: 600; text-align: center; caret-color: transparent; }
+    input.hotkey.recording { border-color: #0a84ff; background: #eef5ff; color: #0a84ff; }
+    input.hotkey.empty { color: #999; font-weight: 400; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #ccc; flex: none; }
+    .dot.on { background: #2bb24c; }
+    .dot.off { background: #e0453a; }
+    .btn.mini { padding: 3px 8px; font-size: 13px; }
     .grid {
       display:grid;
       grid-template-columns: auto 1fr;
@@ -55,13 +64,26 @@
       <input id="apiKeyInput" type="text" placeholder="AIza..." />
     </div>
 
-    <label>OCR & Dịch:</label>
-    <div class="row">
-      <input id="hotkeyInput" type="text" placeholder="CommandOrControl+Shift+S" />
+    <label></label>
+    <div class="section-title">Phím tắt <span class="hint">— bấm vào ô rồi nhấn tổ hợp phím · Backspace để tắt · Esc để huỷ</span></div>
+
+    <label>Chụp màn hình</label>
+    <div class="row hk-row">
+      <input id="hk-capture" class="hotkey" data-id="capture" type="text" readonly />
+      <span class="dot" id="dot-capture"></span>
+      <button class="btn mini" data-reset="capture" title="Về mặc định">↺</button>
     </div>
-    <label>Chat AI:</label>
-    <div class="row">
-      <input id="chatHotkeyInput" type="text" placeholder="CommandOrControl+Shift+C" />
+    <label>OCR & Dịch</label>
+    <div class="row hk-row">
+      <input id="hk-ocr" class="hotkey" data-id="ocr" type="text" readonly />
+      <span class="dot" id="dot-ocr"></span>
+      <button class="btn mini" data-reset="ocr" title="Về mặc định">↺</button>
+    </div>
+    <label>Chat AI</label>
+    <div class="row hk-row">
+      <input id="hk-chat" class="hotkey" data-id="chat" type="text" readonly />
+      <span class="dot" id="dot-chat"></span>
+      <button class="btn mini" data-reset="chat" title="Về mặc định">↺</button>
     </div>
 
     <label></label>
