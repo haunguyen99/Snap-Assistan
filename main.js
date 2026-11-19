@@ -2,7 +2,7 @@
 // ✅ Fixed typo (ipcMain not pcMain)
 // ✅ Includes chat-ask handler, no syntax errors
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu, clipboard, nativeImage, dialog, shell, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -217,19 +217,113 @@ function createResultWindow() {
 
 // =============== Overlay & OCR ===============
 async function openOverlay() {
+  if (overlayWindow && !overlayWindow.isDestroyed()) { overlayWindow.focus(); return; }
   const display = screen.getPrimaryDisplay();
-  const { width, height } = display.size;
+  // Capture at physical resolution so HiDPI screens stay sharp.
+  const width = Math.round(display.size.width * display.scaleFactor);
+  const height = Math.round(display.size.height * display.scaleFactor);
   const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width, height } });
-  const image = sources[0]?.thumbnail?.toDataURL();
+  const source = sources.find(s => s.display_id === String(display.id)) || sources[0];
+  const image = source?.thumbnail?.toDataURL();
   if (!image) return;
-  overlayWindow = new BrowserWindow({ fullscreen: true, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
-    webPreferences: { preload: path.join(__dirname, 'overlay.js'), nodeIntegration: true, contextIsolation: false } });
+  overlayWindow = new BrowserWindow({
+    ...display.bounds, fullscreen: true, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
+    resizable: false, movable: false, show: false,
+    webPreferences: { nodeIntegration: true, contextIsolation: false }
+  });
+  overlayWindow.setAlwaysOnTop(true, 'screen-saver');
   overlayWindow.on('closed', () => overlayWindow = null);
   overlayWindow.loadFile('overlay.html');
-  overlayWindow.webContents.once('did-finish-load', () => overlayWindow.webContents.send('set-image', image));
+  overlayWindow.webContents.once('did-finish-load', () => {
+    overlayWindow.webContents.send('set-image', image);
+    overlayWindow.show();
+    overlayWindow.focus();
+  });
 }
 
-ipcMain.handle('cancel-overlay', async () => { if (overlayWindow) overlayWindow.close(); });
+function closeOverlay() { if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close(); }
+
+function notify(body) {
+  if (Notification.isSupported()) new Notification({ title: 'Snap Assistant', body, silent: true }).show();
+}
+
+function timestampName() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `Screenshot_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.png`;
+}
+
+async function ocrDataUrl(dataUrl) {
+  const buf = Buffer.from(String(dataUrl).replace(/^data:image\/png;base64,/, ''), 'base64');
+  const { data: { text } } = await Tesseract.recognize(buf, 'eng+vie');
+  return (text || '').trim();
+}
+
+function printImage(dataUrl) {
+  const win = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: false, contextIsolation: true } });
+  const html = `<!doctype html><html><head><style>
+    @page { margin: 10mm; } html,body { margin:0; }
+    img { max-width:100%; max-height:100vh; object-fit:contain; display:block; margin:auto; }
+  </style></head><body><img src="${dataUrl}"></body></html>`;
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+  win.webContents.once('did-finish-load', () => {
+    win.webContents.print({ silent: false, printBackground: true }, (ok, reason) => {
+      if (!ok && reason && reason !== 'cancelled') log('Print failed:', reason);
+      win.close();
+    });
+  });
+}
+
+// Actions from the Lightshot-style toolbar
+ipcMain.handle('overlay-action', async (_e, { action, dataUrl } = {}) => {
+  if (!dataUrl) return { keepOpen: true, message: 'Không có ảnh' };
+  switch (action) {
+    case 'copy': {
+      clipboard.writeImage(nativeImage.createFromDataURL(dataUrl));
+      closeOverlay();
+      notify('Đã sao chép ảnh vào clipboard');
+      return { ok: true };
+    }
+    case 'save': {
+      // Hide the always-on-top overlay so the dialog is visible; restore on cancel.
+      overlayWindow?.hide();
+      const lastDir = store.get('lastSaveDir') || app.getPath('pictures');
+      const { canceled, filePath } = await dialog.showSaveDialog({
+        title: 'Lưu ảnh chụp màn hình',
+        defaultPath: path.join(lastDir, timestampName()),
+        filters: [{ name: 'PNG', extensions: ['png'] }, { name: 'JPEG', extensions: ['jpg', 'jpeg'] }]
+      });
+      if (canceled || !filePath) {
+        if (overlayWindow) { overlayWindow.show(); overlayWindow.focus(); }
+        return { keepOpen: true };
+      }
+      const img = nativeImage.createFromDataURL(dataUrl);
+      const buf = /\.jpe?g$/i.test(filePath) ? img.toJPEG(92) : img.toPNG();
+      await fsp.writeFile(filePath, buf);
+      store.set('lastSaveDir', path.dirname(filePath));
+      closeOverlay();
+      notify(`Đã lưu: ${path.basename(filePath)}`);
+      return { ok: true };
+    }
+    case 'print': {
+      closeOverlay();
+      printImage(dataUrl);
+      return { ok: true };
+    }
+    case 'search': {
+      overlayWindow?.webContents.send('overlay-toast', '🔍 Đang OCR...');
+      const text = await ocrDataUrl(dataUrl);
+      if (!text) return { keepOpen: true, message: 'Không nhận diện được văn bản trong vùng chọn' };
+      closeOverlay();
+      const q = text.replace(/\s+/g, ' ').slice(0, 500);
+      await shell.openExternal(`https://www.google.com/search?q=${encodeURIComponent(q)}`);
+      return { ok: true };
+    }
+    default:
+      return { keepOpen: true, message: `Không hỗ trợ: ${action}` };
+  }
+});
+
+ipcMain.handle('cancel-overlay', async () => closeOverlay());
 ipcMain.handle('region-selected', async (_event, dataUrl) => {
   if (overlayWindow) overlayWindow.close();
   const base64Data = String(dataUrl || '').replace(/^data:image\/png;base64,/, '');
