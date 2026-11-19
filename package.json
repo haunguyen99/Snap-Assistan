@@ -6,6 +6,7 @@
   "main": "main.js",
   "author": "Your Name",
   "license": "MIT",
+  "homepage": "https://github.com/haunguyen99/Snap-Assistan",
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
@@ -13,7 +14,7 @@
     "build": "electron-builder",
     "build:win": "electron-builder --win nsis",
     "build:mac": "electron-builder --mac dmg",
-    "build:linux": "electron-builder --linux AppImage"
+    "build:linux": "electron-builder --linux"
   },
   "dependencies": {
     "electron-store": "^8.2.0",
@@ -57,9 +58,17 @@
       "icon": "build/icon.icns"
     },
     "linux": {
-      "target": "AppImage",
+      "target": [
+        "AppImage",
+        "deb",
+        "tar.gz"
+      ],
       "category": "Utility",
-      "icon": "build"
+      "icon": "icon.png",
+      "executableName": "snap-assistant",
+      "artifactName": "snap-assistant-${version}-${arch}.${ext}",
+      "maintainer": "haunguyen99 <haunguyen99@users.noreply.github.com>",
+      "synopsis": "Screenshot, OCR & translate with AI"
     },
     "extraMetadata": {
       "name": "Snap Assistant"
