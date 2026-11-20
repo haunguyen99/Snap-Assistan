@@ -18,8 +18,10 @@ import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.AudioAttributes
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaPlayer
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -27,6 +29,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.speech.tts.TextToSpeech
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
@@ -51,6 +54,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import java.util.Locale
 import kotlin.math.abs
 
 /**
@@ -118,6 +122,7 @@ class BubbleService : Service() {
         projection = mp
         setupCapture()
         showBubble()
+        ensureTts()
         running = true
         return START_NOT_STICKY
     }
@@ -129,6 +134,15 @@ class BubbleService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Bong bóng OCR", NotificationManager.IMPORTANCE_LOW)
         )
+        val notif = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(NOTIF_ID, notif)
+        }
+    }
+
+    private fun buildNotification(): Notification {
         val stopPi = PendingIntent.getService(
             this, 0, Intent(this, BubbleService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE,
@@ -136,19 +150,14 @@ class BubbleService : Service() {
         val openPi = PendingIntent.getActivity(
             this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val notif = Notification.Builder(this, CHANNEL_ID)
+        return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notify)
-            .setContentTitle("Snap Assistant đang chạy")
-            .setContentText("Chạm bong bóng để OCR & dịch")
+            .setContentTitle("Snap Assistant · Chế độ: ${modeLabel()}")
+            .setContentText("Chạm bong bóng để chọn vùng chữ · Nhấn giữ để đổi chế độ")
             .setContentIntent(openPi)
             .addAction(Notification.Action.Builder(null, "Tắt", stopPi).build())
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
     }
 
     // ---------------------------------------------------------------- capture
@@ -264,29 +273,51 @@ class BubbleService : Service() {
 
         val slop = ViewConfiguration.get(this).scaledTouchSlop
         var downX = 0f; var downY = 0f; var startX = 0; var startY = 0; var moved = false
+        var longPressed = false
+        // Long-press switches between pronunciation and translation mode.
+        val longPress = Runnable {
+            if (!moved) {
+                longPressed = true
+                view.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                toggleMode()
+            }
+        }
         view.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY; startX = lp.x; startY = lp.y; moved = false
+                    longPressed = false
+                    main.postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = e.rawX - downX; val dy = e.rawY - downY
                     if (moved || abs(dx) > slop || abs(dy) > slop) {
                         moved = true
+                        main.removeCallbacks(longPress)
                         lp.x = startX + dx.toInt()
                         lp.y = startY + dy.toInt()
                         wm.updateViewLayout(view, lp)
                     }
                 }
                 MotionEvent.ACTION_UP -> {
-                    if (!moved) onBubbleTapped() else snapToEdge(view, lp)
+                    main.removeCallbacks(longPress)
+                    if (moved) snapToEdge(view, lp) else if (!longPressed) onBubbleTapped()
                 }
+                MotionEvent.ACTION_CANCEL -> main.removeCallbacks(longPress)
             }
             true
         }
         wm.addView(view, lp)
         bubble = view
         bubbleParams = lp
+    }
+
+    private fun modeLabel() = if (prefs.mode == Prefs.MODE_TRANSLATE) "Dịch" else "Phát âm"
+
+    private fun toggleMode() {
+        prefs.mode = if (prefs.mode == Prefs.MODE_TRANSLATE) Prefs.MODE_PRONOUNCE else Prefs.MODE_TRANSLATE
+        toast("Chế độ: ${modeLabel()}")
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
     }
 
     private fun snapToEdge(view: View, lp: WindowManager.LayoutParams) {
@@ -310,27 +341,90 @@ class BubbleService : Service() {
     }
 
     private fun showSelection(shot: Bitmap) {
-        val view = SelectionView(
-            this, shot,
+        val tapToPick = prefs.mode != Prefs.MODE_TRANSLATE
+        // Pronunciation mode: OCR the whole screen right away so a word can be tapped directly.
+        var words: List<Pair<Rect, String>>? = null
+        var pendingTap: Pair<Float, Float>? = null
+        lateinit var view: SelectionView
+
+        fun pick(x: Float, y: Float) {
+            val list = words ?: run { pendingTap = x to y; return }
+            val hit = wordAt(list, x, y)
+            if (hit == null) {
+                toast("Không thấy từ ở chỗ này")
+                return
+            }
+            val word = Dictionary.extractWords(hit.second).firstOrNull()
+            if (word == null) {
+                toast("\"${hit.second}\" không phải từ tiếng Anh")
+                return
+            }
+            // Stay on the overlay so more words can be tapped; the card goes on the side
+            // of the screen away from the word so it does not cover it.
+            view.highlight(hit.first)
+            // Speak at once with the phone's voice; the dictionary (IPA, recordings) loads after.
+            speak(word, Locale.US)
+            val wordInLowerHalf = hit.first.centerY() > shot.height / 2
+            pronounce(singleWord = true, atTop = wordInLowerHalf) { word }
+        }
+
+        view = SelectionView(
+            this, shot, tapToPick,
             onSelected = { rect -> finishSelection(shot, rect) },
+            onTap = { x, y -> pick(x, y) },
             onCancel = { finishSelection(shot, null) },
         )
         wm.addView(view, fullScreenParams(focusable = false))
         selectionView = view
+
+        if (tapToPick) {
+            scope.launch {
+                val found = runCatching { recognizeWords(shot) }.getOrElse { emptyList() }
+                if (selectionView !== view) return@launch
+                words = found
+                view.setWordBoxes(found.map { it.first })
+                pendingTap?.let { (x, y) -> pendingTap = null; pick(x, y) }
+            }
+        }
+    }
+
+    /** The word box under (x, y), or the nearest one within a finger's width. */
+    private fun wordAt(list: List<Pair<Rect, String>>, x: Float, y: Float): Pair<Rect, String>? {
+        val reach = dp(24).toFloat()
+        var best: Pair<Rect, String>? = null
+        var bestD = Float.MAX_VALUE
+        for (w in list) {
+            val r = w.first
+            val dx = maxOf(r.left - x, 0f, x - r.right)
+            val dy = maxOf(r.top - y, 0f, y - r.bottom)
+            val d = dx * dx + dy * dy
+            if (d < bestD) { bestD = d; best = w }
+        }
+        return best?.takeIf { bestD <= reach * reach }
+    }
+
+    /** Close everything: the word-picking overlay and any card on top of it. */
+    private fun closeAll() {
+        removeResult()
+        stopAudio()
+        if (selectionView != null) {
+            selectionView?.let { runCatching { wm.removeViewImmediate(it) } }
+            selectionView = null
+            bubble?.visibility = View.VISIBLE
+            busy = false
+        }
     }
 
     private fun finishSelection(shot: Bitmap, rect: Rect?) {
-        selectionView?.let { runCatching { wm.removeView(it) } }
+        if (rect == null) { closeAll(); return }
+        // Remove synchronously so the view never draws `shot` again. `shot` is left to the GC:
+        // recycling it here crashed the app ("trying to use a recycled bitmap").
+        selectionView?.let { runCatching { wm.removeViewImmediate(it) } }
         selectionView = null
         bubble?.visibility = View.VISIBLE
         busy = false
-        if (rect == null) {
-            shot.recycle()
-            return
-        }
         val crop = Bitmap.createBitmap(shot, rect.left, rect.top, rect.width(), rect.height())
-        if (crop !== shot) shot.recycle()
-        runOcrAndTranslate(crop)
+        if (prefs.mode == Prefs.MODE_TRANSLATE) runOcrAndTranslate(crop) else runOcrAndPronounce(crop)
     }
 
     private fun runOcrAndTranslate(crop: Bitmap) {
@@ -356,6 +450,17 @@ class BubbleService : Service() {
         }
     }
 
+    /** Every OCR word on the bitmap with its box, in bitmap coordinates. */
+    private suspend fun recognizeWords(src: Bitmap): List<Pair<Rect, String>> {
+        val result = suspendCancellableCoroutine { cont ->
+            recognizer.process(InputImage.fromBitmap(src, 0))
+                .addOnSuccessListener { cont.resume(it) }
+                .addOnFailureListener { cont.resumeWithException(it) }
+        }
+        return result.textBlocks.flatMap { b -> b.lines.flatMap { l -> l.elements } }
+            .mapNotNull { el -> el.boundingBox?.let { it to el.text } }
+    }
+
     private suspend fun recognize(src: Bitmap): String {
         // ML Kit nhận chữ tốt hơn khi chữ đủ lớn: phóng to vùng chọn nhỏ.
         val scale = if (src.width < 800 && src.height < 800) 2 else 1
@@ -373,15 +478,13 @@ class BubbleService : Service() {
 
     // ---------------------------------------------------------------- result panel
 
-    private inner class ResultPanel(val root: View, val ocr: TextView, val tr: TextView) {
+    private inner class ResultPanel(val ocr: TextView, val tr: TextView) {
         fun setOcr(s: String) { ocr.text = s }
         fun setTranslation(s: String) { tr.text = s }
     }
 
     private fun showResult(): ResultPanel {
         removeResult()
-        val pad = dp(14)
-        val (_, sh, _) = screenMetrics()
 
         fun label(s: String) = TextView(this).apply {
             text = s
@@ -404,6 +507,23 @@ class BubbleService : Service() {
             addView(label("VĂN BẢN GỐC (OCR)"))
             addView(ocr)
         }
+        attachPanel(
+            content,
+            listOf("Copy bản dịch" to { copy(tr.text) }, "Copy gốc" to { copy(ocr.text) }),
+        )
+        return ResultPanel(ocr, tr)
+    }
+
+    private fun panelButton(s: String, onClick: () -> Unit) = Button(this).apply {
+        text = s
+        isAllCaps = false
+        setOnClickListener { onClick() }
+    }
+
+    /** Bottom card overlay: scrollable [content] (max half screen) plus a row of buttons and "Đóng". */
+    private fun attachPanel(content: View, actions: List<Pair<String, () -> Unit>>, atTop: Boolean = false) {
+        val pad = dp(14)
+        val (_, sh, _) = screenMetrics()
         val scroll = object : ScrollView(this) {
             override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
                 val max = (sh * 0.5f).toInt()
@@ -411,17 +531,11 @@ class BubbleService : Service() {
             }
         }.apply { addView(content) }
 
-        fun btn(s: String, onClick: () -> Unit) = Button(this).apply {
-            text = s
-            isAllCaps = false
-            setOnClickListener { onClick() }
-        }
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END
-            addView(btn("Copy bản dịch") { copy(tr.text) })
-            addView(btn("Copy gốc") { copy(ocr.text) })
-            addView(btn("Đóng") { removeResult() })
+            actions.forEach { (label, action) -> addView(panelButton(label, action)) }
+            addView(panelButton("Đóng") { closeAll() })
         }
 
         val root = LinearLayout(this).apply {
@@ -442,13 +556,169 @@ class BubbleService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT,
         ).apply {
-            gravity = Gravity.BOTTOM
-            y = dp(24)
+            gravity = if (atTop) Gravity.TOP else Gravity.BOTTOM
+            y = if (atTop) dp(48) else dp(24)
             horizontalMargin = 0.03f
         }
         wm.addView(root, lp)
         resultView = root
-        return ResultPanel(root, ocr, tr)
+    }
+
+    // ---------------------------------------------------------------- pronunciation panel
+
+    private fun runOcrAndPronounce(crop: Bitmap) = pronounce(singleWord = false) {
+        try {
+            recognize(crop)
+        } finally {
+            crop.recycle()
+        }
+    }
+
+    /** Pronunciation panel for the English words in the text that [source] returns. */
+    private fun pronounce(singleWord: Boolean, atTop: Boolean = false, source: suspend () -> String) {
+        removeResult()
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val status = smallText("⏳ Đang nhận dạng chữ...")
+        list.addView(status)
+        var fullText = ""
+        // A single tapped word needs no "read all" button.
+        val actions = if (singleWord) emptyList() else listOf("🔊 Đọc cả đoạn" to { speak(fullText, Locale.US) })
+        attachPanel(list, actions, atTop)
+
+        scope.launch {
+            val text = try {
+                source()
+            } catch (e: Exception) {
+                status.text = "❌ Lỗi OCR: ${e.message}"
+                return@launch
+            }
+            val words = Dictionary.extractWords(text)
+            if (words.isEmpty()) {
+                status.text = "(Không thấy từ tiếng Anh nào)"
+                return@launch
+            }
+            fullText = text.replace(Regex("\\s+"), " ").trim()
+            list.removeAllViews()
+            words.forEach { word ->
+                val ipa = smallText("…")
+                val row = wordRow(word, ipa)
+                list.addView(row.view)
+                launch {
+                    when (val r = Dictionary.lookup(word)) {
+                        is Dictionary.Result.Found -> {
+                            val p = r.pron
+                            // Unlabelled IPA in this dictionary is usually the British form.
+                            val uk = p.ukIpa ?: p.ipa?.takeIf { it != p.usIpa }
+                            ipa.text = when {
+                                p.usIpa != null && uk != null -> "US ${p.usIpa}   UK ${uk}"
+                                else -> p.usIpa ?: uk ?: p.ipa ?: ""
+                            }
+                            row.usAudio = p.usAudio
+                            row.ukAudio = p.ukAudio
+                        }
+                        Dictionary.Result.NotFound -> ipa.text = "(không có trong từ điển)"
+                        is Dictionary.Result.Error -> ipa.text = "(không tra được: ${r.message})"
+                    }
+                    // A single tapped word is read out straight away.
+                }
+            }
+        }
+    }
+
+    private inner class WordRow(val view: View) {
+        var usAudio: String? = null
+        var ukAudio: String? = null
+    }
+
+    private fun wordRow(word: String, ipa: TextView): WordRow {
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(this@BubbleService).apply {
+                text = word
+                setTextColor(Color.parseColor("#0F172A"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            })
+            addView(ipa)
+        }
+        val line = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            addView(texts, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val row = WordRow(line)
+        line.addView(panelButton("🔊 US") { play(row.usAudio, word, Locale.US) })
+        line.addView(panelButton("🔊 UK") { play(row.ukAudio, word, Locale.UK) })
+        return row
+    }
+
+    private fun smallText(s: String) = TextView(this).apply {
+        text = s
+        setTextColor(Color.parseColor("#475569"))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+    }
+
+    // ---------------------------------------------------------------- audio
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var player: MediaPlayer? = null
+
+    private fun ensureTts() {
+        if (tts != null) return
+        tts = TextToSpeech(this) { status -> ttsReady = status == TextToSpeech.SUCCESS }
+    }
+
+    /** Recorded dictionary audio when there is one, otherwise the phone's text-to-speech voice. */
+    private fun play(audioUrl: String?, word: String, locale: Locale) {
+        if (audioUrl == null) { speak(word, locale); return }
+        stopAudio()
+        player = MediaPlayer().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            setOnPreparedListener { it.start() }
+            setOnCompletionListener { it.release(); if (player === it) player = null }
+            setOnErrorListener { mp, _, _ ->
+                mp.release(); if (player === mp) player = null
+                speak(word, locale)
+                true
+            }
+            try {
+                setDataSource(audioUrl)
+                prepareAsync()
+            } catch (e: Exception) {
+                release(); player = null
+                speak(word, locale)
+            }
+        }
+    }
+
+    private fun speak(text: String, locale: Locale) {
+        if (text.isBlank()) return
+        ensureTts()
+        val engine = tts ?: return
+        if (!ttsReady) {
+            toast("Giọng đọc đang khởi động, thử lại sau giây lát")
+            return
+        }
+        stopAudio()
+        val res = engine.setLanguage(locale)
+        if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+            toast("Máy chưa có giọng tiếng Anh: cài trong Cài đặt → Chuyển văn bản thành giọng nói")
+            return
+        }
+        engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "snap-tts")
+    }
+
+    private fun stopAudio() {
+        player?.let { runCatching { it.stop() }; it.release() }
+        player = null
+        tts?.stop()
     }
 
     private fun removeResult() {
@@ -482,6 +752,9 @@ class BubbleService : Service() {
         reader = null
         imageThread.quitSafely()
         recognizer.close()
+        stopAudio()
+        tts?.shutdown()
+        tts = null
         super.onDestroy()
     }
 

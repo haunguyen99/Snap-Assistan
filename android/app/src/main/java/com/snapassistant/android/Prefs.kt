@@ -17,7 +17,14 @@ class Prefs(context: Context) {
         get() = sp.getString("model", DEFAULT_MODEL) ?: DEFAULT_MODEL
         set(v) = sp.edit().putString("model", v.trim().ifEmpty { DEFAULT_MODEL }).apply()
 
+    /** What the bubble does with the OCR text: [MODE_PRONOUNCE] or [MODE_TRANSLATE]. */
+    var mode: String
+        get() = sp.getString("mode", MODE_PRONOUNCE) ?: MODE_PRONOUNCE
+        set(v) = sp.edit().putString("mode", v).apply()
+
     companion object {
         const val DEFAULT_MODEL = "gemini-2.5-flash"
+        const val MODE_PRONOUNCE = "pronounce"
+        const val MODE_TRANSLATE = "translate"
     }
 }

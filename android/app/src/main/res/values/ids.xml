@@ -1,0 +1,4 @@
+<resources>
+    <item name="mode_pronounce" type="id" />
+    <item name="mode_translate" type="id" />
+</resources>

@@ -16,6 +16,8 @@ import android.view.Gravity
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -45,7 +47,7 @@ class MainActivity : Activity() {
             setTextColor(Color.parseColor("#1E293B"))
         })
         root.addView(TextView(this).apply {
-            text = "Bong bóng nổi → chạm để chụp màn hình → kéo chọn vùng → OCR (ML Kit, offline) → dịch bằng Gemini."
+            text = "Bong bóng nổi: chạm để chụp màn hình, kéo chọn vùng chữ, rồi xem phát âm hoặc bản dịch."
             setPadding(0, dp(6), 0, dp(16))
             setTextColor(Color.parseColor("#475569"))
         })
@@ -54,7 +56,28 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         langInput = field(root, "Dịch sang ngôn ngữ", prefs.targetLang)
-        modelInput = field(root, "Model Gemini", prefs.model)
+        modelInput = field(root, "Model Gemini (chỉ dùng khi dịch)", prefs.model)
+
+        root.addView(TextView(this).apply {
+            text = "Chọn vùng xong thì (nhấn giữ bong bóng để đổi nhanh)"
+            setTextColor(Color.parseColor("#334155"))
+            setPadding(0, dp(12), 0, dp(2))
+        })
+        val modes = RadioGroup(this).apply {
+            addView(RadioButton(this@MainActivity).apply {
+                id = R.id.mode_pronounce
+                text = "Phát âm: phiên âm IPA + đọc to từ tiếng Anh"
+            })
+            addView(RadioButton(this@MainActivity).apply {
+                id = R.id.mode_translate
+                text = "Dịch bằng Gemini"
+            })
+            check(if (prefs.mode == Prefs.MODE_TRANSLATE) R.id.mode_translate else R.id.mode_pronounce)
+            setOnCheckedChangeListener { _, checked ->
+                prefs.mode = if (checked == R.id.mode_translate) Prefs.MODE_TRANSLATE else Prefs.MODE_PRONOUNCE
+            }
+        }
+        root.addView(modes)
 
         root.addView(button("Lưu cài đặt") {
             prefs.apiKey = keyInput.text.toString()
