@@ -251,32 +251,74 @@ function createResultWindow() {
 }
 
 // =============== Overlay & OCR ===============
+// One overlay window per monitor, so a region can be picked on any screen.
+let overlayWindows = [];
+let overlayOpening = false;
+
+function liveOverlays() { return overlayWindows.filter(w => !w.isDestroyed()); }
+
 async function openOverlay(mode = 'capture') {
-  if (overlayWindow && !overlayWindow.isDestroyed()) { overlayWindow.focus(); return; }
-  const display = screen.getPrimaryDisplay();
-  // Capture at physical resolution so HiDPI screens stay sharp.
-  const width = Math.round(display.size.width * display.scaleFactor);
-  const height = Math.round(display.size.height * display.scaleFactor);
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width, height } });
-  const source = sources.find(s => s.display_id === String(display.id)) || sources[0];
-  const image = source?.thumbnail?.toDataURL();
-  if (!image) return;
-  overlayWindow = new BrowserWindow({
-    ...display.bounds, fullscreen: true, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
-    resizable: false, movable: false, show: false,
-    webPreferences: { nodeIntegration: true, contextIsolation: false }
-  });
-  overlayWindow.setAlwaysOnTop(true, 'screen-saver');
-  overlayWindow.on('closed', () => overlayWindow = null);
-  overlayWindow.loadFile('overlay.html');
-  overlayWindow.webContents.once('did-finish-load', () => {
-    overlayWindow.webContents.send('set-image', image, mode);
-    overlayWindow.show();
-    overlayWindow.focus();
-  });
+  if (overlayOpening) return;
+  const open = liveOverlays();
+  if (open.length) { (overlayWindow && !overlayWindow.isDestroyed() ? overlayWindow : open[0]).focus(); return; }
+  overlayOpening = true;
+  try {
+    const displays = screen.getAllDisplays();
+    const cursorDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    // Capture at physical resolution so HiDPI screens stay sharp. Thumbnails keep
+    // their aspect ratio inside this box, so use the largest screen's size.
+    const width = Math.max(...displays.map(d => Math.round(d.size.width * d.scaleFactor)));
+    const height = Math.max(...displays.map(d => Math.round(d.size.height * d.scaleFactor)));
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width, height } });
+
+    displays.forEach((display, i) => {
+      // display_id can be empty on some Windows setups; fall back to enumeration order.
+      const source = sources.find(s => s.display_id === String(display.id)) || sources[i];
+      let thumb = source?.thumbnail;
+      if (!thumb || thumb.isEmpty()) return;
+      // Smaller screens come back scaled up to the shared box; bring them back to native size.
+      const nativeW = Math.round(display.size.width * display.scaleFactor);
+      const nativeH = Math.round(display.size.height * display.scaleFactor);
+      const sz = thumb.getSize();
+      if (sz.width !== nativeW || sz.height !== nativeH) {
+        thumb = thumb.resize({ width: nativeW, height: nativeH, quality: 'best' });
+      }
+      const image = thumb.toDataURL();
+      const win = new BrowserWindow({
+        ...display.bounds, fullscreen: true, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
+        resizable: false, movable: false, show: false, enableLargerThanScreen: true,
+        webPreferences: { nodeIntegration: true, contextIsolation: false }
+      });
+      // Re-apply bounds: Windows can mis-size windows created on a monitor with a different DPI.
+      win.setBounds(display.bounds);
+      win.setAlwaysOnTop(true, 'screen-saver');
+      win.on('closed', () => {
+        overlayWindows = overlayWindows.filter(w => w !== win);
+        if (overlayWindow === win) overlayWindow = null;
+      });
+      win.loadFile('overlay.html');
+      win.webContents.once('did-finish-load', () => {
+        win.webContents.send('set-image', image, mode);
+        win.show();
+        if (display.id === cursorDisplay.id) win.focus();
+      });
+      // The overlay under the cursor gets keyboard focus first; later the one the user clicks.
+      win.on('focus', () => { overlayWindow = win; });
+      if (display.id === cursorDisplay.id || !overlayWindow) overlayWindow = win;
+      overlayWindows.push(win);
+    });
+  } finally {
+    overlayOpening = false;
+  }
 }
 
-function closeOverlay() { if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.close(); }
+function closeOverlay() {
+  liveOverlays().forEach(w => w.close());
+  overlayWindows = [];
+  overlayWindow = null;
+}
+function hideOverlays() { liveOverlays().forEach(w => w.hide()); }
+function showOverlays() { liveOverlays().forEach(w => w.show()); }
 
 function notify(body) {
   if (Notification.isSupported()) new Notification({ title: 'Snap Assistant', body, silent: true }).show();
@@ -309,8 +351,9 @@ function printImage(dataUrl) {
 }
 
 // Actions from the Lightshot-style toolbar
-ipcMain.handle('overlay-action', async (_e, { action, dataUrl } = {}) => {
+ipcMain.handle('overlay-action', async (e, { action, dataUrl } = {}) => {
   if (!dataUrl) return { keepOpen: true, message: 'Không có ảnh' };
+  const senderWin = BrowserWindow.fromWebContents(e.sender);
   switch (action) {
     case 'copy': {
       clipboard.writeImage(nativeImage.createFromDataURL(dataUrl));
@@ -320,7 +363,7 @@ ipcMain.handle('overlay-action', async (_e, { action, dataUrl } = {}) => {
     }
     case 'save': {
       // Hide the always-on-top overlay so the dialog is visible; restore on cancel.
-      overlayWindow?.hide();
+      hideOverlays();
       const lastDir = store.get('lastSaveDir') || app.getPath('pictures');
       const { canceled, filePath } = await dialog.showSaveDialog({
         title: 'Lưu ảnh chụp màn hình',
@@ -328,7 +371,8 @@ ipcMain.handle('overlay-action', async (_e, { action, dataUrl } = {}) => {
         filters: [{ name: 'PNG', extensions: ['png'] }, { name: 'JPEG', extensions: ['jpg', 'jpeg'] }]
       });
       if (canceled || !filePath) {
-        if (overlayWindow) { overlayWindow.show(); overlayWindow.focus(); }
+        showOverlays();
+        if (senderWin && !senderWin.isDestroyed()) senderWin.focus();
         return { keepOpen: true };
       }
       const img = nativeImage.createFromDataURL(dataUrl);
@@ -345,7 +389,7 @@ ipcMain.handle('overlay-action', async (_e, { action, dataUrl } = {}) => {
       return { ok: true };
     }
     case 'search': {
-      overlayWindow?.webContents.send('overlay-toast', '🔍 Đang OCR...');
+      senderWin?.webContents.send('overlay-toast', '🔍 Đang OCR...');
       const text = await ocrDataUrl(dataUrl);
       if (!text) return { keepOpen: true, message: 'Không nhận diện được văn bản trong vùng chọn' };
       closeOverlay();
@@ -360,7 +404,7 @@ ipcMain.handle('overlay-action', async (_e, { action, dataUrl } = {}) => {
 
 ipcMain.handle('cancel-overlay', async () => closeOverlay());
 ipcMain.handle('region-selected', async (_event, dataUrl) => {
-  if (overlayWindow) overlayWindow.close();
+  closeOverlay();
   const base64Data = String(dataUrl || '').replace(/^data:image\/png;base64,/, '');
   const tmpPath = path.join(app.getPath('temp'), 'capture.png');
   await fsp.writeFile(tmpPath, base64Data, 'base64');
