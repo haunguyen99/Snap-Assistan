@@ -42,11 +42,13 @@ window.addEventListener('DOMContentLoaded', () => {
   window.focus();
 });
 
-// 'capture' = full Lightshot-style editor; 'ocr' = OCR & translate as soon as a region is picked
+// 'capture' = full Lightshot-style editor; 'ocr' = OCR & translate as soon as a region is picked;
+// 'record' = pick/adjust a region, then start a screen recording of it
 let overlayMode = 'capture';
 
 ipcRenderer.on('set-image', (_e, dataUrl, mode) => {
-  overlayMode = mode === 'ocr' ? 'ocr' : 'capture';
+  overlayMode = ['ocr', 'record'].includes(mode) ? mode : 'capture';
+  document.body.classList.toggle('mode-record', overlayMode === 'record');
   img.onload = () => { resizeCanvas(); };
   img.src = dataUrl;
 });
@@ -184,7 +186,8 @@ function updateChrome() {
   label.style.top = `${above ? y - lh - 4 : y + 4}px`;
 
   const showTools = mode !== 'selecting' && overlayMode !== 'ocr';
-  tv.style.display = th.style.display = showTools ? 'flex' : 'none';
+  tv.style.display = showTools && overlayMode !== 'record' ? 'flex' : 'none';
+  th.style.display = showTools ? 'flex' : 'none';
   if (!showTools) return;
 
   // Vertical toolbar: right of selection, else left, else inside.
@@ -209,7 +212,7 @@ function bindPointer() {
   canvas.addEventListener('mousedown', onDown);
   window.addEventListener('mousemove', onMove);
   window.addEventListener('mouseup', onUp);
-  canvas.addEventListener('dblclick', () => { if (sel && !tool) doAction('copy'); });
+  canvas.addEventListener('dblclick', () => { if (sel && !tool) overlayMode === 'record' ? startRecording() : doAction('copy'); });
   canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); cancel(); });
 }
 
@@ -402,6 +405,7 @@ function bindToolbar() {
   $('btnPrint').addEventListener('click', () => doAction('print'));
   $('btnCopy').addEventListener('click', () => doAction('copy'));
   $('btnSave').addEventListener('click', () => doAction('save'));
+  $('btnRecord').addEventListener('click', startRecording);
   $('btnClose').addEventListener('click', cancel);
   $('textInput').addEventListener('input', autosizeText);
   // Keep toolbar clicks from starting a new selection on the canvas below
@@ -470,8 +474,9 @@ function bindKeys() {
     if (e.ctrlKey && k === 's') { e.preventDefault(); return doAction('save'); }
     if (e.ctrlKey && k === 'p') { e.preventDefault(); return doAction('print'); }
     if (e.ctrlKey && k === 'z') { e.preventDefault(); return undo(); }
-    if (e.key === 'Enter') { e.preventDefault(); return doAction('ocr'); }
+    if (e.key === 'Enter') { e.preventDefault(); return overlayMode === 'record' ? startRecording() : doAction('ocr'); }
     if (e.ctrlKey || e.altKey) return;
+    if (overlayMode === 'record') return;
     const map = { p: 'pen', l: 'line', a: 'arrow', r: 'rect', m: 'marker', t: 'text' };
     if (map[k]) setTool(tool === map[k] ? null : map[k]);
     // Arrow keys nudge the selection (Shift = resize)
@@ -515,6 +520,20 @@ async function doAction(action) {
       const res = await ipcRenderer.invoke('overlay-action', { action, dataUrl });
       if (res && res.keepOpen) { busy = false; if (res.message) toast(res.message); }
     }
+  } catch (err) {
+    busy = false;
+    toast(`Lỗi: ${err.message || err}`);
+  }
+}
+
+// Hand the region (CSS pixels of this window/display) to main, which starts the recorder.
+async function startRecording() {
+  if (!sel || busy) return;
+  if (textEdit) commitText();
+  busy = true;
+  try {
+    const res = await ipcRenderer.invoke('record-start', { x: sel.x, y: sel.y, w: sel.w, h: sel.h });
+    if (res && res.keepOpen) { busy = false; if (res.message) toast(res.message); }
   } catch (err) {
     busy = false;
     toast(`Lỗi: ${err.message || err}`);

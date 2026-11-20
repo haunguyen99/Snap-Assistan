@@ -3,7 +3,7 @@ const { ipcRenderer } = require('electron');
 
 const $ = (id) => document.getElementById(id);
 const apiKeyInput = $('apiKeyInput');
-const HOTKEY_IDS = ['capture', 'ocr', 'chat'];
+const HOTKEY_IDS = ['capture', 'ocr', 'record', 'chat'];
 let hotkeyDefaults = {};
 const autoLaunchToggle = $('autoLaunchToggle');
 const autoLaunchHiddenToggle = $('autoLaunchHiddenToggle');

@@ -138,6 +138,8 @@ ipcMain.handle('set-single-capture', (_e, on) => { store.set('singleCapture', !!
 const HOTKEYS = {
   capture: { storeKey: 'captureHotkey', def: 'CommandOrControl+Shift+X', label: 'Chụp màn hình', run: () => openOverlay('capture') },
   ocr:     { storeKey: 'hotkey',        def: 'CommandOrControl+Shift+S', label: 'OCR & Dịch',     run: () => openOverlay('ocr') },
+  // Same key opens the region picker and, while recording, stops and saves.
+  record:  { storeKey: 'recordHotkey',  def: 'CommandOrControl+Alt+R',   label: 'Quay video',     run: () => toggleRecording() },
   chat:    { storeKey: 'chatHotkey',    def: 'CommandOrControl+Shift+C', label: 'Chat AI',        run: () => { if (!chatWindow) createChatWindow(); openOrFocus(chatWindow); } }
 };
 const activeHotkeys = {}; // id -> accelerator currently registered
@@ -255,11 +257,13 @@ function createResultWindow() {
 // One overlay window per monitor, so a region can be picked on any screen.
 let overlayWindows = [];
 let overlayOpening = false;
+const overlayInfo = new WeakMap(); // overlay window -> { display, sourceId }
 
 function liveOverlays() { return overlayWindows.filter(w => !w.isDestroyed()); }
 
 async function openOverlay(mode = 'capture') {
   if (overlayOpening) return;
+  if (rec) { notify('Đang quay video — dừng quay trước đã'); return; }
   const open = liveOverlays();
   if (open.length) { (overlayWindow && !overlayWindow.isDestroyed() ? overlayWindow : open[0]).focus(); return; }
   overlayOpening = true;
@@ -307,6 +311,7 @@ async function openOverlay(mode = 'capture') {
       // The overlay under the cursor gets keyboard focus first; later the one the user clicks.
       win.on('focus', () => { overlayWindow = win; });
       if (display.id === cursorDisplay.id || !overlayWindow) overlayWindow = win;
+      overlayInfo.set(win, { display, sourceId: source.id });
       overlayWindows.push(win);
     });
   } finally {
@@ -428,6 +433,198 @@ ipcMain.handle('region-selected', async (_event, dataUrl) => {
   if (resultWindow) resultWindow.webContents.send('screenshot-result', { ocr: ocrText, translation: translated });
 });
 
+// =============== Region screen recording ===============
+// Overlay picks a region -> a hidden recorder window captures that display, crops it and
+// encodes it (recorder.js). A click-through frame marks the region; a small bar controls it.
+let rec = null; // { capWin, barWin, frameWin, tmpPath, out, ext, stopping }
+
+function toggleRecording() {
+  if (rec) return finishRecording('stop');
+  return openOverlay('record');
+}
+
+function recTimestampName(ext) {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `Recording_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+}
+
+ipcMain.handle('record-start', async (e, rect) => {
+  if (rec) return { keepOpen: true, message: 'Đang quay một video khác' };
+  const info = overlayInfo.get(BrowserWindow.fromWebContents(e.sender));
+  if (!info || !rect || rect.w < 8 || rect.h < 8) return { keepOpen: true, message: 'Vùng chọn quá nhỏ' };
+  closeOverlay();
+  // Let the frozen-screenshot overlay disappear before the capture starts.
+  await new Promise(r => setTimeout(r, 250));
+  try {
+    await startRecording(info.display, info.sourceId, rect);
+  } catch (err) {
+    log('Record start failed:', err);
+    discardRecording();
+    notify(`Không bắt đầu quay được: ${err.message || err}`);
+  }
+  return { ok: true };
+});
+
+async function startRecording(display, fallbackSourceId, rect) {
+  // Source ids can change between captures; look the display up again.
+  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
+  const source = sources.find(s => s.display_id === String(display.id));
+  const sourceId = source?.id || fallbackSourceId;
+
+  const b = display.bounds;
+  const region = {
+    x: Math.round(b.x + rect.x), y: Math.round(b.y + rect.y),
+    width: Math.round(rect.w), height: Math.round(rect.h)
+  };
+
+  const tmpPath = path.join(app.getPath('temp'), `snap-recording-${Date.now()}.part`);
+  rec = { tmpPath, out: fs.createWriteStream(tmpPath), ext: 'webm', stopping: false };
+
+  // Frame: 4px larger on every side; its 2px border stays outside the captured area.
+  const pad = 4;
+  const frameBounds = { x: region.x - pad, y: region.y - pad, width: region.width + pad * 2, height: region.height + pad * 2 };
+  const frameWin = new BrowserWindow({
+    ...frameBounds, transparent: true, frame: false, resizable: false, movable: false, focusable: false,
+    skipTaskbar: true, hasShadow: false, alwaysOnTop: true, show: false, enableLargerThanScreen: true,
+    webPreferences: { nodeIntegration: false, contextIsolation: true }
+  });
+  frameWin.setBounds(frameBounds); // Windows can mis-size windows on a monitor with another DPI
+  frameWin.setIgnoreMouseEvents(true);
+  frameWin.setAlwaysOnTop(true, 'screen-saver');
+  frameWin.loadFile('recframe.html');
+  frameWin.once('ready-to-show', () => frameWin.showInactive());
+  rec.frameWin = frameWin;
+
+  // Control bar: below the region, else above, else inside its bottom edge.
+  const barW = 300, barH = 40, gap = 8;
+  let bx = Math.round(region.x + region.width / 2 - barW / 2);
+  bx = Math.min(Math.max(bx, b.x), b.x + b.width - barW);
+  let by = region.y + region.height + pad + gap;
+  if (by + barH > b.y + b.height) by = region.y - pad - gap - barH;
+  if (by < b.y) by = region.y + region.height - barH - gap;
+  const barBounds = { x: bx, y: by, width: barW, height: barH };
+  const barWin = new BrowserWindow({
+    ...barBounds, transparent: true, frame: false, resizable: false, skipTaskbar: true, alwaysOnTop: true,
+    show: false, focusable: false, hasShadow: false,
+    webPreferences: { nodeIntegration: true, contextIsolation: false }
+  });
+  barWin.setBounds(barBounds);
+  barWin.setAlwaysOnTop(true, 'screen-saver');
+  // Keep the bar out of the video in case it ends up over the region.
+  barWin.setContentProtection(true);
+  barWin.loadFile('recbar.html');
+  barWin.once('ready-to-show', () => barWin.showInactive());
+  rec.barWin = barWin;
+
+  const capWin = new BrowserWindow({
+    show: false, width: 200, height: 200, skipTaskbar: true,
+    webPreferences: { nodeIntegration: true, contextIsolation: false, backgroundThrottling: false }
+  });
+  rec.capWin = capWin;
+  capWin.loadFile('recorder.html');
+  await new Promise(r => capWin.webContents.once('did-finish-load', r));
+  if (!rec || rec.capWin !== capWin) return; // cancelled while loading
+  capWin.webContents.send('rec-init', {
+    sourceId,
+    crop: rect,
+    displayWidth: display.size.width,
+    physW: Math.round(display.size.width * display.scaleFactor),
+    physH: Math.round(display.size.height * display.scaleFactor),
+    fps: 30,
+    audio: !!store.get('recordAudio', true)
+  });
+  log('Recording region', JSON.stringify(region), 'on display', display.id, 'source', sourceId);
+  buildTrayMenu();
+}
+
+function fromRecorder(e) { return !!rec && !!rec.capWin && !rec.capWin.isDestroyed() && e.sender === rec.capWin.webContents; }
+
+ipcMain.on('rec-log', (_e, msg) => log(msg));
+ipcMain.on('rec-started', (e, info) => {
+  if (!fromRecorder(e)) return;
+  rec.ext = info.ext;
+  if (rec.barWin && !rec.barWin.isDestroyed()) rec.barWin.webContents.send('rec-started', info);
+  tray?.setToolTip('Snap Assistant — đang quay video');
+});
+ipcMain.on('rec-chunk', (e, bytes) => { if (fromRecorder(e)) rec.out.write(Buffer.from(bytes)); });
+ipcMain.on('rec-control', (_e, cmd) => {
+  if (!rec) return;
+  if (cmd === 'pause' || cmd === 'resume') { if (rec.capWin && !rec.capWin.isDestroyed()) rec.capWin.webContents.send('rec-cmd', cmd); }
+  else if (cmd === 'stop' || cmd === 'cancel') finishRecording(cmd);
+});
+ipcMain.on('rec-error', (e, msg) => {
+  if (!fromRecorder(e)) return;
+  log('Recorder error:', msg);
+  discardRecording();
+  notify(`Lỗi quay video: ${msg}`);
+});
+ipcMain.on('rec-cancelled', (e) => {
+  if (!fromRecorder(e)) return;
+  discardRecording();
+  notify('Đã huỷ quay video');
+});
+ipcMain.on('rec-finished', async (e) => {
+  if (!fromRecorder(e)) return;
+  const { tmpPath, ext } = rec;
+  await teardownRecording();
+  await saveRecording(tmpPath, ext);
+});
+
+function finishRecording(cmd) {
+  if (!rec || rec.stopping) return;
+  rec.stopping = true;
+  // Hide the frame/bar right away; the recorder flushes and reports back.
+  [rec.frameWin, rec.barWin].forEach(w => { if (w && !w.isDestroyed()) w.hide(); });
+  if (rec.capWin && !rec.capWin.isDestroyed()) rec.capWin.webContents.send('rec-cmd', cmd);
+  else discardRecording();
+}
+
+async function discardRecording() {
+  const tmp = rec?.tmpPath;
+  await teardownRecording();
+  if (tmp) await fsp.unlink(tmp).catch(() => {});
+}
+
+// Closes the recording windows; resolves once the temp file is fully flushed.
+function teardownRecording() {
+  if (!rec) return Promise.resolve();
+  const r = rec;
+  rec = null;
+  [r.frameWin, r.barWin, r.capWin].forEach(w => { if (w && !w.isDestroyed()) w.destroy(); });
+  tray?.setToolTip('Snap Assistant');
+  buildTrayMenu();
+  return new Promise(resolve => r.out ? r.out.end(resolve) : resolve());
+}
+
+async function saveRecording(tmpPath, ext) {
+  const lastDir = store.get('lastVideoDir') || app.getPath('videos');
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    title: 'Lưu video quay màn hình',
+    defaultPath: path.join(lastDir, recTimestampName(ext)),
+    filters: [{ name: ext.toUpperCase(), extensions: [ext] }]
+  });
+  if (canceled || !filePath) {
+    await fsp.unlink(tmpPath).catch(() => {});
+    notify('Đã bỏ video vừa quay');
+    return;
+  }
+  try {
+    await fsp.rename(tmpPath, filePath).catch(async () => {
+      await fsp.copyFile(tmpPath, filePath); // different drive
+      await fsp.unlink(tmpPath).catch(() => {});
+    });
+    store.set('lastVideoDir', path.dirname(filePath));
+    if (Notification.isSupported()) {
+      const n = new Notification({ title: 'Snap Assistant', body: `Đã lưu video: ${path.basename(filePath)} — bấm để mở thư mục`, silent: true });
+      n.on('click', () => shell.showItemInFolder(filePath));
+      n.show();
+    }
+  } catch (err) {
+    log('Save recording failed:', err);
+    notify(`Không lưu được video: ${err.message}`);
+  }
+}
+
 // =============== Tray ===============
 function buildTrayMenu() {
   if (!tray || tray.isDestroyed()) return;
@@ -440,6 +637,8 @@ function buildTrayMenu() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Chụp màn hình', click: () => openOverlay('capture') },
     { label: 'OCR & Dịch', click: () => openOverlay('ocr') },
+    rec ? { label: '⏹ Dừng quay & lưu video', click: () => finishRecording('stop') }
+        : { label: 'Quay video vùng chọn', click: () => openOverlay('record') },
     { label: 'Chat với AI', click: () => { if (!chatWindow) createChatWindow(); openOrFocus(chatWindow); } },
     { label: 'Mở Settings', click: () => openOrFocus(mainWindow) },
     { type: 'separator' },
@@ -473,4 +672,7 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', (e) => e.preventDefault());
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
+  if (rec) { const tmp = rec.tmpPath; teardownRecording(); try { fs.unlinkSync(tmp); } catch (_) {} }
+});
