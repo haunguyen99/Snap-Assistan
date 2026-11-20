@@ -48,6 +48,13 @@
     .dot.on { background: #2bb24c; }
     .dot.off { background: #e0453a; }
     .btn.mini { padding: 3px 8px; font-size: 13px; }
+    .update-row { flex-wrap: wrap; }
+    .upd-version { font-weight: 600; }
+    .upd-status { color: #555; flex: 1; min-width: 120px; }
+    .upd-status.err { color: #b60000; }
+    .upd-status.good { color: #0a7e0a; }
+    .upd-bar { display: none; width: 90px; height: 6px; background: #e6e6e6; border-radius: 3px; overflow: hidden; }
+    .upd-bar div { height: 100%; width: 0; background: #0a84ff; transition: width .2s; }
     .grid {
       display:grid;
       grid-template-columns: auto 1fr;
@@ -96,6 +103,19 @@
         <input id="singleCaptureToggle" type="checkbox" />
         <span>Dùng <b>1</b> file ảnh OCR (ghi đè)</span>       
       </div>
+    </div>
+
+    <label>Cập nhật</label>
+    <div class="row update-row">
+      <span id="updVersion" class="upd-version"></span>
+      <span id="updStatus" class="upd-status"></span>
+      <div class="upd-bar" id="updBar"><div id="updBarFill"></div></div>
+      <button id="btnUpdate" class="btn mini">Kiểm tra cập nhật</button>
+    </div>
+    <label></label>
+    <div class="check">
+      <input id="autoUpdateToggle" type="checkbox" />
+      <span>Tự động kiểm tra và tải bản mới</span>
     </div>
   </div>
 

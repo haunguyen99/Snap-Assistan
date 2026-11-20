@@ -184,6 +184,47 @@ document.querySelectorAll('[data-reset]').forEach((btn) => {
   btn.addEventListener('click', () => setHotkeyValue(btn.dataset.reset, hotkeyDefaults[btn.dataset.reset] || ''));
 });
 
+// ---------------------------------------------------------------- update
+const updStatus = $('updStatus');
+const btnUpdate = $('btnUpdate');
+let updState = null;
+
+function renderUpdate(u) {
+  updState = u;
+  $('updVersion').textContent = `v${u.current}`;
+  $('autoUpdateToggle').checked = !!u.autoCheck;
+  const bar = $('updBar');
+  bar.style.display = u.status === 'downloading' ? 'block' : 'none';
+  $('updBarFill').style.width = `${u.percent || 0}%`;
+  updStatus.className = 'upd-status';
+  btnUpdate.disabled = false;
+  switch (u.status) {
+    case 'checking':
+      updStatus.textContent = 'Đang kiểm tra...'; btnUpdate.disabled = true; btnUpdate.textContent = 'Kiểm tra cập nhật'; break;
+    case 'latest':
+      updStatus.textContent = 'Đang dùng bản mới nhất'; updStatus.classList.add('good'); btnUpdate.textContent = 'Kiểm tra cập nhật'; break;
+    case 'downloading':
+      updStatus.textContent = `Đang tải bản ${u.version}... ${u.percent || 0}%`; btnUpdate.disabled = true; btnUpdate.textContent = 'Đang tải'; break;
+    case 'ready':
+      updStatus.textContent = `Bản ${u.version} đã sẵn sàng`; updStatus.classList.add('good'); btnUpdate.textContent = 'Khởi động lại để cập nhật'; break;
+    case 'available':
+      updStatus.textContent = `Có bản mới ${u.version}${u.selfUpdate ? '' : ' (bản này không tự cập nhật được)'}`; btnUpdate.textContent = 'Mở trang tải về'; break;
+    case 'error':
+      updStatus.textContent = u.error || 'Lỗi kiểm tra cập nhật'; updStatus.classList.add('err'); btnUpdate.textContent = 'Thử lại'; break;
+    default:
+      updStatus.textContent = u.selfUpdate ? '' : 'Bản này chỉ báo khi có bản mới'; btnUpdate.textContent = 'Kiểm tra cập nhật';
+  }
+}
+
+btnUpdate.addEventListener('click', async () => {
+  if (updState?.status === 'ready') return ipcRenderer.invoke('update-install');
+  if (updState?.status === 'available') return ipcRenderer.invoke('update-open-releases');
+  renderUpdate(await ipcRenderer.invoke('update-check'));
+});
+$('autoUpdateToggle').addEventListener('change', (e) => ipcRenderer.invoke('update-set-auto', e.target.checked));
+ipcRenderer.on('update-status', (_e, u) => renderUpdate(u));
+ipcRenderer.invoke('update-get-state').then(renderUpdate).catch(() => {});
+
 btnApply.addEventListener('click', handleApply);
 btnDefault.addEventListener('click', setDefaultsOnlyInUI);
 btnClose.addEventListener('click', () => ipcRenderer.send('close-main'));

@@ -11,6 +11,7 @@ const StoreMod = require('electron-store');
 const Store = StoreMod?.default || StoreMod;
 const store = new Store();
 const fetch = (...args) => import('node-fetch').then(({ default: _fetch }) => _fetch(...args));
+const updater = require('./updater');
 
 let mainWindow, resultWindow, overlayWindow, chatWindow, tray;
 let tessServer = null;
@@ -222,7 +223,7 @@ function openOrFocus(win) { if (win && !win.isDestroyed()) { win.show(); win.foc
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
-    width: 600, height: 380, show: true,
+    width: 600, height: 450, show: true,
     title: 'Snap Assistant - Settings', autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, 'renderer.js'), nodeIntegration: true, contextIsolation: false }
   });
@@ -427,6 +428,33 @@ ipcMain.handle('region-selected', async (_event, dataUrl) => {
   if (resultWindow) resultWindow.webContents.send('screenshot-result', { ocr: ocrText, translation: translated });
 });
 
+// =============== Tray ===============
+function buildTrayMenu() {
+  if (!tray || tray.isDestroyed()) return;
+  const u = updater.getState();
+  const updateItem =
+    u.status === 'ready' ? { label: `Khởi động lại để cập nhật lên ${u.version}`, click: () => updater.installNow() } :
+    u.status === 'downloading' ? { label: `Đang tải bản ${u.version}... ${u.percent}%`, enabled: false } :
+    u.status === 'available' ? { label: `Tải bản mới ${u.version}`, click: () => shell.openExternal(updater.RELEASES_URL) } :
+    { label: 'Kiểm tra cập nhật', click: () => updater.checkForUpdates({ manual: true }).then(showManualCheckResult) };
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Chụp màn hình', click: () => openOverlay('capture') },
+    { label: 'OCR & Dịch', click: () => openOverlay('ocr') },
+    { label: 'Chat với AI', click: () => { if (!chatWindow) createChatWindow(); openOrFocus(chatWindow); } },
+    { label: 'Mở Settings', click: () => openOrFocus(mainWindow) },
+    { type: 'separator' },
+    updateItem,
+    { label: `Phiên bản ${app.getVersion()}`, enabled: false },
+    { type: 'separator' },
+    { label: 'Thoát', click: () => { app.isQuiting = true; app.quit(); } }
+  ]));
+}
+
+function showManualCheckResult(u) {
+  if (u.status === 'latest') notify(`Bạn đang dùng bản mới nhất (${u.current}).`);
+  else if (u.status === 'error') notify(`Không kiểm tra được cập nhật: ${u.error}`);
+}
+
 // =============== App Lifecycle ===============
 app.whenReady().then(() => {
   createMainWindow();
@@ -435,14 +463,9 @@ app.whenReady().then(() => {
 
   tray = new Tray(path.join(__dirname, 'icon.png'));
   tray.setToolTip('Snap Assistant');
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Chụp màn hình', click: () => openOverlay('capture') },
-    { label: 'OCR & Dịch', click: () => openOverlay('ocr') },
-    { label: 'Chat với AI', click: () => { if (!chatWindow) createChatWindow(); openOrFocus(chatWindow); } },
-    { label: 'Mở Settings', click: () => openOrFocus(mainWindow) },
-    { type: 'separator' },
-    { label: 'Thoát', click: () => { app.isQuiting = true; app.quit(); } }
-  ]));
+  buildTrayMenu();
+
+  updater.init({ log, store, notify, onStateChange: buildTrayMenu });
 
   registerAllHotkeys();
 
