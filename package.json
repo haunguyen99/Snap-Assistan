@@ -1,7 +1,7 @@
 {
   "name": "snap-assistant",
   "productName": "Snap Assistant",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Screenshot → OCR (Tesseract) → Translate (Gemini) với overlay chọn vùng.",
   "main": "main.js",
   "author": "Your Name",
@@ -42,7 +42,8 @@
       "!dist-*/**",
       "!*.log",
       "!build-log.txt",
-      "!*.bat"
+      "!*.bat",
+      "!android/**"
     ],
     "directories": {
       "buildResources": "build"

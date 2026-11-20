@@ -275,7 +275,7 @@ async function openOverlay(mode = 'capture') {
       // display_id can be empty on some Windows setups; fall back to enumeration order.
       const source = sources.find(s => s.display_id === String(display.id)) || sources[i];
       let thumb = source?.thumbnail;
-      if (!thumb || thumb.isEmpty()) return;
+      if (!thumb || thumb.isEmpty()) { log(`Overlay: không chụp được màn hình ${display.id}`, display.bounds); return; }
       // Smaller screens come back scaled up to the shared box; bring them back to native size.
       const nativeW = Math.round(display.size.width * display.scaleFactor);
       const nativeH = Math.round(display.size.height * display.scaleFactor);
@@ -300,6 +300,7 @@ async function openOverlay(mode = 'capture') {
       win.webContents.once('did-finish-load', () => {
         win.webContents.send('set-image', image, mode);
         win.show();
+        log(`Overlay: display ${display.id} (scale ${display.scaleFactor})`, JSON.stringify(display.bounds), '-> window', JSON.stringify(win.getBounds()), 'source', source.display_id || '(none)', JSON.stringify(thumb.getSize()));
         if (display.id === cursorDisplay.id) win.focus();
       });
       // The overlay under the cursor gets keyboard focus first; later the one the user clicks.
