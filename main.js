@@ -257,9 +257,65 @@ function createResultWindow() {
 // One overlay window per monitor, so a region can be picked on any screen.
 let overlayWindows = [];
 let overlayOpening = false;
-const overlayInfo = new WeakMap(); // overlay window -> { display, sourceId }
+const overlayInfo = new WeakMap(); // overlay window -> { display, sourceId, srcBounds }
+const isLinux = process.platform === 'linux';
 
 function liveOverlays() { return overlayWindows.filter(w => !w.isDestroyed()); }
+
+function unionBounds(displays) {
+  const x = Math.min(...displays.map(d => d.bounds.x)), y = Math.min(...displays.map(d => d.bounds.y));
+  const r = Math.max(...displays.map(d => d.bounds.x + d.bounds.width));
+  const b = Math.max(...displays.map(d => d.bounds.y + d.bounds.height));
+  return { x, y, width: r - x, height: b - y };
+}
+function sameRect(a, b) { return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height; }
+
+// Decide which capture source shows which monitor, and which desktop area (DIP) it covers.
+// Returns Map(display.id -> { source, bounds }).
+//  - Windows / X11: one source per monitor, normally matched by display_id. On X11 the id
+//    comes from EDID and may not match Electron's, so unmatched ones pair up by shape/order.
+//  - Wayland (PipeWire portal): a single source, either one monitor the user picked or the
+//    whole desktop ("full workspace"); its aspect ratio tells which.
+function mapSourcesToDisplays(sources, displays, cursorDisplay) {
+  const result = new Map();
+  const usable = sources.filter(s => s.thumbnail && !s.thumbnail.isEmpty());
+  const aspectOf = s => { const z = s.thumbnail.getSize(); return z.width / z.height; };
+  const close = (a, b) => Math.abs(a - b) / b < 0.02;
+
+  for (const d of displays) {
+    const s = usable.find(src => src.display_id && src.display_id === String(d.id));
+    if (s) result.set(d.id, { source: s, bounds: d.bounds });
+  }
+  const used = new Set([...result.values()].map(m => m.source));
+  let rest = usable.filter(s => !used.has(s));
+  let left = displays.filter(d => !result.has(d.id));
+  if (!rest.length || !left.length) return result;
+
+  if (displays.length > 1 && result.size === 0 && rest.length === 1) {
+    const desktop = unionBounds(displays);
+    const a = aspectOf(rest[0]);
+    if (close(a, desktop.width / desktop.height) && !displays.some(d => close(a, d.bounds.width / d.bounds.height))) {
+      for (const d of displays) result.set(d.id, { source: rest[0], bounds: desktop });
+      return result;
+    }
+  }
+
+  // Pair the rest: same count -> enumeration order; otherwise closest aspect ratio,
+  // preferring the monitor under the cursor (Wayland: the one the user just picked is unknown).
+  if (rest.length === left.length) {
+    left.forEach((d, i) => result.set(d.id, { source: rest[i], bounds: d.bounds }));
+    return result;
+  }
+  for (const s of rest) {
+    if (!left.length) break;
+    const a = aspectOf(s);
+    const score = d => Math.abs(a - d.bounds.width / d.bounds.height) - (d.id === cursorDisplay.id ? 0.001 : 0);
+    const d = left.reduce((best, x) => (score(x) < score(best) ? x : best));
+    result.set(d.id, { source: s, bounds: d.bounds });
+    left = left.filter(x => x !== d);
+  }
+  return result;
+}
 
 async function openOverlay(mode = 'capture') {
   if (overlayOpening) return;
@@ -270,18 +326,33 @@ async function openOverlay(mode = 'capture') {
   try {
     const displays = screen.getAllDisplays();
     const cursorDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-    // Capture at physical resolution so HiDPI screens stay sharp. Thumbnails keep
-    // their aspect ratio inside this box, so use the largest screen's size.
-    const width = Math.max(...displays.map(d => Math.round(d.size.width * d.scaleFactor)));
-    const height = Math.max(...displays.map(d => Math.round(d.size.height * d.scaleFactor)));
+    const desktop = unionBounds(displays);
+    const maxScale = Math.max(...displays.map(d => d.scaleFactor));
+    // Capture at physical resolution so HiDPI screens stay sharp. Thumbnails keep their
+    // aspect ratio inside this box; it is big enough for one monitor or for a source that
+    // spans the whole desktop (Linux/Wayland can return a single such source).
+    const width = Math.round(desktop.width * maxScale);
+    const height = Math.round(desktop.height * maxScale);
     const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width, height } });
+    const mapping = mapSourcesToDisplays(sources, displays, cursorDisplay);
+    log(`Overlay: ${displays.length} màn hình, ${sources.length} nguồn chụp`,
+      JSON.stringify(sources.map(s => ({ id: s.id, display_id: s.display_id, size: s.thumbnail.getSize() }))));
 
-    displays.forEach((display, i) => {
-      // display_id can be empty on some Windows setups; fall back to enumeration order.
-      const source = sources.find(s => s.display_id === String(display.id)) || sources[i];
-      let thumb = source?.thumbnail;
-      if (!thumb || thumb.isEmpty()) { log(`Overlay: không chụp được màn hình ${display.id}`, display.bounds); return; }
-      // Smaller screens come back scaled up to the shared box; bring them back to native size.
+    displays.forEach((display) => {
+      const m = mapping.get(display.id);
+      if (!m) { log(`Overlay: không có ảnh cho màn hình ${display.id}`, JSON.stringify(display.bounds)); return; }
+      const { source, bounds: srcBounds } = m;
+      let thumb = source.thumbnail;
+      // Cut this monitor out when the source covers more than it (whole-desktop source).
+      if (!sameRect(srcBounds, display.bounds)) {
+        const sz = thumb.getSize();
+        const k = sz.width / srcBounds.width;
+        thumb = thumb.crop({
+          x: Math.round((display.bounds.x - srcBounds.x) * k), y: Math.round((display.bounds.y - srcBounds.y) * k),
+          width: Math.round(display.bounds.width * k), height: Math.round(display.bounds.height * k)
+        });
+      }
+      // Thumbnails come back scaled to the shared box; bring them back to native size.
       const nativeW = Math.round(display.size.width * display.scaleFactor);
       const nativeH = Math.round(display.size.height * display.scaleFactor);
       const sz = thumb.getSize();
@@ -289,9 +360,13 @@ async function openOverlay(mode = 'capture') {
         thumb = thumb.resize({ width: nativeW, height: nativeH, quality: 'best' });
       }
       const image = thumb.toDataURL();
+      // On Linux the window manager places a window that is fullscreen from the start on the
+      // primary monitor, so position it first and go fullscreen after it is shown. It must stay
+      // resizable there: GTK pins a non-resizable window's size (min = max), and window managers
+      // then refuse fullscreen and keep it inside the work area, leaving panels/docks uncovered.
       const win = new BrowserWindow({
-        ...display.bounds, fullscreen: true, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
-        resizable: false, movable: false, show: false, enableLargerThanScreen: true,
+        ...display.bounds, fullscreen: !isLinux, transparent: true, frame: false, alwaysOnTop: true, skipTaskbar: true,
+        resizable: isLinux, movable: false, show: false, enableLargerThanScreen: true, fullscreenable: true,
         webPreferences: { nodeIntegration: true, contextIsolation: false }
       });
       // Re-apply bounds: Windows can mis-size windows created on a monitor with a different DPI.
@@ -305,17 +380,48 @@ async function openOverlay(mode = 'capture') {
       win.webContents.once('did-finish-load', () => {
         win.webContents.send('set-image', image, mode);
         win.show();
-        log(`Overlay: display ${display.id} (scale ${display.scaleFactor})`, JSON.stringify(display.bounds), '-> window', JSON.stringify(win.getBounds()), 'source', source.display_id || '(none)', JSON.stringify(thumb.getSize()));
+        if (isLinux) fullscreenOnDisplay(win, display);
+        log(`Overlay: display ${display.id} (scale ${display.scaleFactor})`, JSON.stringify(display.bounds), '-> window', JSON.stringify(win.getBounds()), 'source', source.id, source.display_id || '(none)', JSON.stringify(srcBounds), JSON.stringify(thumb.getSize()));
         if (display.id === cursorDisplay.id) win.focus();
       });
       // The overlay under the cursor gets keyboard focus first; later the one the user clicks.
       win.on('focus', () => { overlayWindow = win; });
       if (display.id === cursorDisplay.id || !overlayWindow) overlayWindow = win;
-      overlayInfo.set(win, { display, sourceId: source.id });
+      overlayInfo.set(win, { display, sourceId: source.id, srcBounds });
       overlayWindows.push(win);
     });
+    if (!overlayWindows.length) notify('Không chụp được màn hình nào');
   } finally {
     overlayOpening = false;
+  }
+}
+
+// Linux: the window manager places a newly shown window itself (often on the primary
+// monitor) and fullscreens it on whatever monitor it sits on at that moment. So move it
+// onto its monitor, let the move land, and only then go fullscreen; if it still ends up on
+// another monitor, leave fullscreen, move it back and try again.
+const wait = ms => new Promise(r => setTimeout(r, ms));
+function onDisplay(win, display) {
+  const b = win.getBounds();
+  return screen.getDisplayMatching(b).id === display.id;
+}
+async function fullscreenOnDisplay(win, display) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    if (win.isDestroyed()) return;
+    if (win.isFullScreen()) {
+      win.setFullScreen(false);
+      await wait(150);
+      if (win.isDestroyed()) return;
+    }
+    win.setBounds(display.bounds);
+    await wait(80 * attempt);
+    if (win.isDestroyed()) return;
+    win.setFullScreen(true);
+    await wait(200);
+    if (win.isDestroyed()) return;
+    const got = win.getBounds();
+    if (win.isFullScreen() && onDisplay(win, display) && sameRect(got, display.bounds)) return;
+    log(`Overlay: display ${display.id} lệch chỗ (lần ${attempt})`, JSON.stringify(got), 'fullscreen', win.isFullScreen());
   }
 }
 
@@ -456,7 +562,7 @@ ipcMain.handle('record-start', async (e, rect) => {
   // Let the frozen-screenshot overlay disappear before the capture starts.
   await new Promise(r => setTimeout(r, 250));
   try {
-    await startRecording(info.display, info.sourceId, rect);
+    await startRecording(info, rect);
   } catch (err) {
     log('Record start failed:', err);
     discardRecording();
@@ -465,12 +571,8 @@ ipcMain.handle('record-start', async (e, rect) => {
   return { ok: true };
 });
 
-async function startRecording(display, fallbackSourceId, rect) {
-  // Source ids can change between captures; look the display up again.
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
-  const source = sources.find(s => s.display_id === String(display.id));
-  const sourceId = source?.id || fallbackSourceId;
-
+// Reuses the overlay's source (asking again would re-open the screen picker on Wayland).
+async function startRecording({ display, sourceId, srcBounds }, rect) {
   const b = display.bounds;
   const region = {
     x: Math.round(b.x + rect.x), y: Math.round(b.y + rect.y),
@@ -526,10 +628,11 @@ async function startRecording(display, fallbackSourceId, rect) {
   if (!rec || rec.capWin !== capWin) return; // cancelled while loading
   capWin.webContents.send('rec-init', {
     sourceId,
-    crop: rect,
-    displayWidth: display.size.width,
-    physW: Math.round(display.size.width * display.scaleFactor),
-    physH: Math.round(display.size.height * display.scaleFactor),
+    // Region relative to the area the source shows (a whole-desktop source on Wayland).
+    crop: { ...rect, x: rect.x + b.x - srcBounds.x, y: rect.y + b.y - srcBounds.y },
+    displayWidth: srcBounds.width,
+    physW: Math.round(srcBounds.width * display.scaleFactor),
+    physH: Math.round(srcBounds.height * display.scaleFactor),
     fps: 30,
     audio: !!store.get('recordAudio', true)
   });
